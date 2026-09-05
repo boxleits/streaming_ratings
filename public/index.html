@@ -1,0 +1,789 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Prime Video DE × Rotten Tomatoes</title>
+<style>
+  :root {
+    --bg: #12141a;
+    --bg-raised: #191c24;
+    --bg-input: #1e212b;
+    --line: #2a2e39;
+    --text: #e9e7df;
+    --text-dim: #8b8f9c;
+    --marquee: #e3b23c;
+    --marquee-dim: #8a6d2c;
+    --good: #4caf7d;
+    --warn: #d9704f;
+    --font-display: "Bebas Neue", "Oswald", Impact, sans-serif;
+    --font-body: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    --font-mono: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    background-image:
+      radial-gradient(ellipse 80% 50% at 50% -10%, rgba(227,178,60,0.08), transparent);
+    color: var(--text);
+    font-family: var(--font-body);
+    min-height: 100vh;
+  }
+
+  .wrap {
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 40px 24px 80px;
+  }
+
+  header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 24px;
+    border-bottom: 1px solid var(--line);
+    padding-bottom: 20px;
+    margin-bottom: 24px;
+    flex-wrap: wrap;
+  }
+
+  h1 {
+    font-family: var(--font-display);
+    letter-spacing: 0.04em;
+    font-weight: 400;
+    font-size: 40px;
+    margin: 0;
+    color: var(--text);
+  }
+  h1 span { color: var(--marquee); }
+
+  .subtitle {
+    font-size: 13px;
+    color: var(--text-dim);
+    font-family: var(--font-mono);
+    margin-top: 4px;
+  }
+
+  /* Provider status panel, top right */
+  .status-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    min-width: 320px;
+  }
+  .status-row {
+    display: grid;
+    grid-template-columns: 52px 1fr auto;
+    align-items: center;
+    gap: 10px;
+    background: var(--bg-raised);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 8px 10px;
+  }
+  .status-row.dim { opacity: 0.55; }
+  .status-provider {
+    font-family: var(--font-display);
+    font-size: 16px;
+    letter-spacing: 0.03em;
+    color: var(--text-dim);
+  }
+  .status-text {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    line-height: 1.4;
+  }
+  .status-text .phase-ok { color: var(--good); }
+  .status-text .phase-working { color: var(--marquee); }
+  .status-text .phase-bad { color: var(--warn); }
+  .status-meta { color: var(--text-dim); display: block; margin-top: 2px; }
+
+  button.sync-btn {
+    background: transparent;
+    border: 1px solid var(--line);
+    color: var(--text-dim);
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 0.03em;
+    padding: 6px 10px;
+    border-radius: 2px;
+    cursor: pointer;
+    text-transform: uppercase;
+    white-space: nowrap;
+  }
+  button.sync-btn:hover:not(:disabled) { border-color: var(--marquee); color: var(--marquee); }
+  button.sync-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  .lang-switch {
+    display: flex;
+    gap: 4px;
+    align-self: flex-end;
+  }
+  button.lang-btn {
+    background: transparent;
+    border: 1px solid var(--line);
+    color: var(--text-dim);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.04em;
+    padding: 5px 10px;
+    border-radius: 2px;
+    cursor: pointer;
+    text-transform: uppercase;
+  }
+  button.lang-btn:hover { border-color: var(--marquee); color: var(--marquee); }
+  button.lang-btn.active { border-color: var(--marquee); color: var(--marquee); background: rgba(227,178,60,0.08); }
+
+  .controls {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    margin-bottom: 20px;
+    flex-wrap: wrap;
+  }
+
+  button.secondary {
+    background: transparent;
+    border: 1px solid var(--line);
+    color: var(--text-dim);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.04em;
+    padding: 7px 14px;
+    border-radius: 2px;
+    cursor: pointer;
+    text-transform: uppercase;
+  }
+  button.secondary:hover { border-color: var(--marquee); color: var(--marquee); }
+
+  .table-scroll {
+    overflow-x: auto;
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    max-height: 72vh;
+    overflow-y: auto;
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 14px;
+    min-width: 820px;
+  }
+
+  thead th {
+    text-align: left;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-dim);
+    border-bottom: 1px solid var(--line);
+    padding: 10px 8px;
+    background: var(--bg-raised);
+    white-space: nowrap;
+    cursor: pointer;
+    user-select: none;
+    position: sticky;
+    top: 0;
+    z-index: 2;
+  }
+  thead th:hover { color: var(--marquee); }
+  thead th.active-sort { color: var(--marquee); }
+  .sort-arrow { font-size: 9px; margin-left: 4px; opacity: 0.7; }
+
+  .filter-row th {
+    cursor: default;
+    padding: 6px 8px;
+    background: var(--bg-raised);
+    position: sticky;
+    top: 33px;
+    z-index: 2;
+  }
+  .filter-row input {
+    width: 100%;
+    background: var(--bg-input);
+    border: 1px solid var(--line);
+    color: var(--text);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    padding: 6px 8px;
+    border-radius: 3px;
+  }
+  .filter-row input::placeholder { color: #565a66; }
+  .filter-row input:focus { outline: none; border-color: var(--marquee); }
+
+  /* Sticky horizontally (mirrors the vertical "position: sticky; top" used
+     for thead above) so the "Load more" sentinel stays within whatever
+     horizontal slice of the wide table is currently scrolled into view -
+     otherwise, on a table wider than the viewport (common on mobile), it
+     would sit pinned to the table's left edge and scroll out of view
+     entirely once the user scrolls right to see the RT/Metacritic
+     columns, silently breaking IntersectionObserver-based auto-loading. */
+  .load-more-row {
+    position: sticky;
+    left: 0;
+    text-align: center;
+    padding: 14px 0;
+  }
+
+  tbody td {
+    padding: 12px 8px;
+    border-bottom: 1px solid var(--line);
+    vertical-align: top;
+  }
+  tbody tr:hover { background: var(--bg-raised); }
+
+  .col-title { min-width: 220px; }
+  .col-title a {
+    color: var(--text);
+    text-decoration: none;
+    border-bottom: 1px dotted var(--text-dim);
+  }
+  .col-title a:hover { color: var(--marquee); border-bottom-color: var(--marquee); }
+
+  .col-genre { color: var(--text-dim); min-width: 160px; }
+  .col-year { color: var(--text-dim); font-family: var(--font-mono); width: 70px; }
+  .col-score { width: 90px; font-family: var(--font-mono); text-align: right; }
+  .score-value { color: var(--good); font-weight: 600; }
+  .score-na { color: var(--text-dim); }
+  .score-todo { color: var(--marquee-dim); font-style: italic; }
+
+  .empty-state {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    color: var(--text-dim);
+    padding: 40px 0;
+    text-align: center;
+    border: 1px dashed var(--line);
+    border-radius: 4px;
+  }
+
+  .result-count {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--text-dim);
+    margin: 16px 0 8px;
+    display: flex;
+    justify-content: space-between;
+  }
+
+  footer {
+    margin-top: 48px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-dim);
+    line-height: 1.7;
+    border-top: 1px solid var(--line);
+    padding-top: 16px;
+  }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div>
+        <h1>Prime<span>×</span>Tomatoes</h1>
+        <div class="subtitle" id="subtitleText">Amazon Prime Video (DE) &nbsp;·&nbsp; RT &amp; Metacritic ratings, continuously updated in the background</div>
+      </div>
+
+      <div style="display:flex; flex-direction:column; align-items:flex-end; gap:10px;">
+        <div class="lang-switch" id="langSwitch">
+          <button type="button" class="lang-btn" data-lang="en">EN</button>
+          <button type="button" class="lang-btn" data-lang="de">DE</button>
+        </div>
+        <div class="status-panel">
+          <div class="status-row">
+            <div class="status-provider">TMDb</div>
+            <div class="status-text" id="tmdbStatusText">Connecting ...</div>
+            <button id="tmdbRefreshBtn" class="sync-btn" disabled>Sync now</button>
+          </div>
+          <div class="status-row">
+            <div class="status-provider">OMDb</div>
+            <div class="status-text" id="omdbStatusText">Connecting ...</div>
+            <button id="omdbRefreshBtn" class="sync-btn" disabled>Sync now</button>
+          </div>
+          <div class="status-row" id="traktStatusRow" style="display:none;">
+            <div class="status-provider">Trakt</div>
+            <div class="status-text" id="traktStatusText"></div>
+            <div style="display:flex; gap:4px;">
+              <button id="traktConnectBtn" class="sync-btn" style="display:none;">Connect Trakt</button>
+              <button id="traktRefreshBtn" class="sync-btn" style="display:none;">Sync now</button>
+              <button id="traktDisconnectBtn" class="sync-btn" style="display:none;">Disconnect</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </header>
+
+    <div class="controls">
+      <button id="clearFiltersBtn" class="secondary">Clear column filters</button>
+    </div>
+
+    <div id="resultCount" class="result-count" style="display:none;">
+      <span id="resultCountText"></span>
+      <span id="resultCountFiltered"></span>
+    </div>
+
+    <div class="table-scroll" id="tableScroll">
+      <table id="resultTable" style="display:none;">
+        <thead>
+          <tr>
+            <th data-field="title"><span data-label="colTitle">Title</span><span class="sort-arrow" data-arrow="title"></span></th>
+            <th data-field="genres"><span data-label="colGenres">Genre(s)</span><span class="sort-arrow" data-arrow="genres"></span></th>
+            <th data-field="year" class="col-year"><span data-label="colYear">Year</span><span class="sort-arrow" data-arrow="year"></span></th>
+            <th data-field="rt" class="col-score"><span data-label="colRt">RT&nbsp;%</span><span class="sort-arrow" data-arrow="rt"></span></th>
+            <th data-field="metacritic" class="col-score"><span data-label="colMeta">Meta</span><span class="sort-arrow" data-arrow="metacritic"></span></th>
+            <th data-field="watched" class="col-score"><span data-label="colWatched">Watched</span><span class="sort-arrow" data-arrow="watched"></span></th>
+          </tr>
+          <tr class="filter-row">
+            <th><input type="text" data-filter="title" data-placeholder="filterPlaceholder" placeholder="filter ..." /></th>
+            <th><input type="text" data-filter="genres" data-placeholder="filterPlaceholder" placeholder="filter ..." /></th>
+            <th><input type="text" data-filter="year" data-placeholder="filterYearPlaceholder" placeholder="e.g. 2021" /></th>
+            <th><input type="text" data-filter="rt" data-placeholder="filterMinPlaceholder" placeholder="e.g. 60 = min." /></th>
+            <th><input type="text" data-filter="metacritic" data-placeholder="filterMinPlaceholder" placeholder="e.g. 60 = min." /></th>
+            <th><input type="text" data-filter="watched" data-placeholder="filterPlaceholder" placeholder="filter ..." /></th>
+          </tr>
+        </thead>
+        <tbody id="resultBody"></tbody>
+      </table>
+      <div class="load-more-row">
+        <button id="loadMoreBtn" class="secondary" style="display:none;">Load more</button>
+      </div>
+    </div>
+
+    <div id="emptyState" class="empty-state">Connecting to the server ...</div>
+
+    <footer id="footerText">
+      Data sources: TMDb (catalog, availability, genres, movie page), OMDb (Rotten Tomatoes &amp; Metacritic ratings).<br />
+      <strong>TODO</strong> = not checked yet &nbsp;·&nbsp; <strong>N/A</strong> = checked, no rating available.<br />
+      For the RT / Metacritic columns: a number in the filter (e.g. "60") shows only movies with at least that rating; text (e.g. "N/A") filters as a substring.<br />
+      Click a column header to sort &nbsp;·&nbsp; The catalog sync keeps running in the background even without the page open.
+    </footer>
+  </div>
+
+<script type="module">
+  import { formatScore, passesColumnFilter, passesAllColumnFilters, compareMovies, paginate } from "./js/filters.js";
+  import { createConnectionManager } from "./js/connection.js";
+  import {
+    getStrings,
+    localizePhaseMessage,
+    formatLocalizedDate,
+    projectMovieForLocale,
+    getStoredLanguage,
+    setStoredLanguage,
+  } from "./js/i18n.js";
+
+  const subtitleText = document.getElementById("subtitleText");
+  const langSwitch = document.getElementById("langSwitch");
+  const tmdbStatusText = document.getElementById("tmdbStatusText");
+  const omdbStatusText = document.getElementById("omdbStatusText");
+  const tmdbRefreshBtn = document.getElementById("tmdbRefreshBtn");
+  const omdbRefreshBtn = document.getElementById("omdbRefreshBtn");
+  const traktStatusRow = document.getElementById("traktStatusRow");
+  const traktStatusText = document.getElementById("traktStatusText");
+  const traktConnectBtn = document.getElementById("traktConnectBtn");
+  const traktRefreshBtn = document.getElementById("traktRefreshBtn");
+  const traktDisconnectBtn = document.getElementById("traktDisconnectBtn");
+  const clearFiltersBtn = document.getElementById("clearFiltersBtn");
+  const resultTable = document.getElementById("resultTable");
+  const resultBody = document.getElementById("resultBody");
+  const resultCount = document.getElementById("resultCount");
+  const resultCountText = document.getElementById("resultCountText");
+  const resultCountFiltered = document.getElementById("resultCountFiltered");
+  const emptyState = document.getElementById("emptyState");
+  const footerText = document.getElementById("footerText");
+  const loadMoreBtn = document.getElementById("loadMoreBtn");
+  const tableScroll = document.getElementById("tableScroll");
+
+  // id -> raw, multi-language movie record as received from the server
+  // (title/genres are objects like { en: "...", de: "..." })
+  let movieMap = new Map();
+  let lastEngineStatus = null;
+
+  let currentLang = getStoredLanguage(window.localStorage, window.navigator);
+
+  let columnFilters = { title: "", genres: "", year: "", rt: "", metacritic: "", watched: "" };
+  let sortState = { field: "year", dir: "desc" };
+  let renderScheduled = false;
+
+  // How many DOM rows get painted at once - filtering/sorting themselves
+  // always run over the full dataset regardless of this. Purely a
+  // rendering-cost cap for large catalogs (see README, "Performance on
+  // large catalogs / low-powered devices").
+  const PAGE_SIZE = 200;
+  let visibleCount = PAGE_SIZE;
+
+  function escapeHtml(str) {
+    return String(str).replace(/[&<>"']/g, (c) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+    }[c]));
+  }
+
+  function scheduleRender() {
+    if (renderScheduled) return;
+    renderScheduled = true;
+    // 500ms instead of a shorter debounce: on a large catalog, the engine
+    // can send an "upsert" roughly every OMDB_REQUEST_DELAY_MS (150ms by
+    // default) for extended periods while working through pending rating
+    // checks. Rebuilding the full (filtered/sorted) table on every single
+    // one of those is the main cause of sluggishness on low-powered
+    // devices - this keeps the UI reasonably live without rebuilding on
+    // every single incoming update.
+    setTimeout(() => {
+      renderScheduled = false;
+      renderTable();
+    }, 500);
+  }
+
+  /** Applies every static (non-status, non-table-row) UI string for the current language. */
+  function applyStaticStrings() {
+    const t = getStrings(currentLang);
+    document.documentElement.lang = currentLang;
+
+    subtitleText.textContent = t.subtitle;
+    tmdbRefreshBtn.textContent = t.syncNow;
+    omdbRefreshBtn.textContent = t.syncNow;
+    clearFiltersBtn.textContent = t.clearFilters;
+
+    document.querySelectorAll("[data-label]").forEach((el) => {
+      const key = el.getAttribute("data-label");
+      if (t[key]) el.textContent = t[key];
+    });
+    document.querySelectorAll("[data-placeholder]").forEach((el) => {
+      const key = el.getAttribute("data-placeholder");
+      if (t[key]) el.placeholder = t[key];
+    });
+
+    footerText.innerHTML =
+      `${escapeHtml(t.footerLine1)}<br />` +
+      `${escapeHtml(t.footerLine2)}<br />` +
+      `${escapeHtml(t.footerLine3)}<br />` +
+      `${escapeHtml(t.footerLine4)}`;
+
+    if (movieMap.size === 0) {
+      emptyState.textContent = t.emptyDefault;
+    }
+
+    langSwitch.querySelectorAll(".lang-btn").forEach((btn) => {
+      btn.classList.toggle("active", btn.getAttribute("data-lang") === currentLang);
+    });
+  }
+
+  function formatScoreDisplay(value) {
+    return formatScore(value);
+  }
+
+  function formatWatchedDisplay(value) {
+    if (value === "watched") return { text: "\u2713 Watched", cls: "score-value" };
+    if (value === "unseen") return { text: "Unseen", cls: "score-na" };
+    return { text: "N/A", cls: "score-na" };
+  }
+
+  function renderTable(options = {}) {
+    const { resetPaging = false } = options;
+    if (resetPaging) visibleCount = PAGE_SIZE;
+
+    const t = getStrings(currentLang);
+    const all = Array.from(movieMap.values()).map((m) => projectMovieForLocale(m, currentLang));
+    let rows = all.filter((m) => passesAllColumnFilters(m, columnFilters));
+    rows.sort((a, b) => compareMovies(a, b, sortState.field, sortState.dir));
+
+    // Filtering/sorting above always run over the FULL dataset - only the
+    // actual DOM rendering is capped, so counts and "Load more" always
+    // reflect the true number of matches, not just what's currently painted.
+    const visibleRows = paginate(rows, visibleCount);
+
+    resultBody.innerHTML = "";
+    for (const movie of visibleRows) {
+      const rt = formatScoreDisplay(movie.rt);
+      const meta = formatScoreDisplay(movie.metacritic);
+      const watched = formatWatchedDisplay(movie.watched);
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td class="col-title"><a href="${escapeHtml(movie.tmdbUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(movie.title)}</a></td>
+        <td class="col-genre">${escapeHtml(movie.genres)}</td>
+        <td class="col-year">${escapeHtml(movie.year)}</td>
+        <td class="col-score"><span class="${rt.cls}">${escapeHtml(rt.text)}${movie.rt !== "TODO" && movie.rt !== null ? "%" : ""}</span></td>
+        <td class="col-score"><span class="${meta.cls}">${escapeHtml(meta.text)}</span></td>
+        <td class="col-score"><span class="${watched.cls}">${escapeHtml(watched.text)}</span></td>
+      `;
+      resultBody.appendChild(tr);
+    }
+
+    document.querySelectorAll("thead th[data-field]").forEach((th) => {
+      const field = th.getAttribute("data-field");
+      const arrow = th.querySelector(".sort-arrow");
+      if (field === sortState.field) {
+        th.classList.add("active-sort");
+        arrow.textContent = sortState.dir === "asc" ? "▲" : "▼";
+      } else {
+        th.classList.remove("active-sort");
+        arrow.textContent = "";
+      }
+    });
+
+    if (all.length > 0) {
+      resultTable.style.display = "table";
+      resultCount.style.display = "flex";
+      resultCountText.textContent = t.moviesTotal(all.length);
+      resultCountFiltered.textContent = rows.length !== all.length ? t.visibleAfterFilters(rows.length) : "";
+      emptyState.style.display = rows.length === 0 ? "block" : "none";
+      if (rows.length === 0) {
+        emptyState.textContent = t.emptyNoMatch;
+      }
+    } else {
+      resultTable.style.display = "none";
+      resultCount.style.display = "none";
+      emptyState.style.display = "block";
+      emptyState.textContent = t.emptyDefault;
+    }
+
+    if (rows.length > visibleRows.length) {
+      loadMoreBtn.style.display = "inline-block";
+      loadMoreBtn.textContent = t.loadMore(visibleRows.length, rows.length);
+    } else {
+      loadMoreBtn.style.display = "none";
+    }
+  }
+
+  function loadMoreRows() {
+    visibleCount += PAGE_SIZE;
+    renderTable(); // no resetPaging - just reveals the next chunk of the same result set
+  }
+
+  loadMoreBtn.addEventListener("click", loadMoreRows);
+
+  // Auto-load the next page once the (currently hidden or visible) "Load
+  // more" element scrolls into view inside the table's own scroll
+  // container - this is what makes loading feel automatic/infinite
+  // instead of requiring a click. The button stays clickable too (works
+  // identically), as a fallback for keyboard/screen-reader use and in
+  // case IntersectionObserver isn't available.
+  if (typeof IntersectionObserver !== "undefined" && tableScroll) {
+    const loadMoreObserver = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          // A hidden (display:none) button never intersects, so this
+          // naturally only fires while there's actually more to load.
+          if (entry.isIntersecting) loadMoreRows();
+        }
+      },
+      { root: tableScroll, rootMargin: "200px 0px", threshold: 0 }
+    );
+    loadMoreObserver.observe(loadMoreBtn);
+  }
+
+  document.querySelectorAll("thead th[data-field]").forEach((th) => {
+    th.addEventListener("click", () => {
+      const field = th.getAttribute("data-field");
+      if (sortState.field === field) {
+        sortState.dir = sortState.dir === "asc" ? "desc" : "asc";
+      } else {
+        sortState.field = field;
+        sortState.dir = field === "title" || field === "genres" ? "asc" : "desc";
+      }
+      renderTable({ resetPaging: true });
+    });
+  });
+
+  document.querySelectorAll(".filter-row input[data-filter]").forEach((input) => {
+    input.addEventListener("input", () => {
+      columnFilters[input.getAttribute("data-filter")] = input.value;
+      renderTable({ resetPaging: true });
+    });
+  });
+
+  clearFiltersBtn.addEventListener("click", () => {
+    document.querySelectorAll(".filter-row input[data-filter]").forEach((input) => {
+      input.value = "";
+      columnFilters[input.getAttribute("data-filter")] = "";
+    });
+    renderTable({ resetPaging: true });
+  });
+
+  function phaseClass(phase) {
+    if (phase === "error") return "phase-bad";
+    if (phase === "waiting_for_limit_reset") return "phase-bad";
+    if (phase === "refreshing" || phase === "checking_ratings" || phase === "awaiting_authorization" || phase === "syncing") {
+      return "phase-working";
+    }
+    return "phase-ok";
+  }
+
+  function applyEngineStatus(status) {
+    if (!status) return;
+    lastEngineStatus = status;
+    const t = getStrings(currentLang);
+
+    const tm = status.tmdb;
+    const tmdbMessage = localizePhaseMessage("tmdb", tm, currentLang);
+    tmdbStatusText.innerHTML =
+      `<span class="${phaseClass(tm.phase)}">${escapeHtml(tmdbMessage)}</span>` +
+      `<span class="status-meta">${escapeHtml(t.lastLabel(formatLocalizedDate(tm.lastRefresh, currentLang)))} &nbsp;·&nbsp; ${escapeHtml(t.moviesCountSuffix(tm.movieCount ?? 0))}</span>`;
+    tmdbRefreshBtn.disabled = tm.phase === "refreshing";
+
+    const om = status.omdb;
+    const omdbMessage = localizePhaseMessage("omdb", om, currentLang);
+    let omdbExtra = t.lastFullSyncLabel(formatLocalizedDate(om.lastFullSync, currentLang));
+    if (om.phase === "waiting_for_limit_reset" || om.phase === "checking_ratings") {
+      omdbExtra += ` &nbsp;·&nbsp; ${escapeHtml(t.pendingSuffix(om.pending ?? 0))}`;
+    }
+    omdbStatusText.innerHTML =
+      `<span class="${phaseClass(om.phase)}">${escapeHtml(omdbMessage)}</span>` + `<span class="status-meta">${omdbExtra}</span>`;
+    omdbRefreshBtn.disabled = om.phase === "checking_ratings" || om.phase === "waiting_for_limit_reset";
+
+    const tr = status.trakt;
+    if (!tr || !tr.configured) {
+      traktStatusRow.style.display = "none";
+    } else {
+      traktStatusRow.style.display = "grid";
+
+      let traktMessage;
+      if (tr.phase === "awaiting_authorization" && tr.userCode && tr.verificationUrl) {
+        traktMessage = t.traktGoTo(tr.verificationUrl, tr.userCode);
+      } else {
+        traktMessage = localizePhaseMessage("trakt", tr, currentLang);
+      }
+      let traktExtra = "";
+      if (tr.phase === "idle") {
+        traktExtra = `${escapeHtml(t.lastFullSyncLabel(formatLocalizedDate(tr.lastSync, currentLang)))} &nbsp;·&nbsp; ${escapeHtml(t.moviesCountSuffix(tr.movieCount ?? 0))}`;
+      }
+      traktStatusText.innerHTML =
+        `<span class="${phaseClass(tr.phase)}">${escapeHtml(traktMessage)}</span>` +
+        (traktExtra ? `<span class="status-meta">${traktExtra}</span>` : "");
+
+      // Exactly one action button visible at a time, matching the current phase.
+      const showConnect = tr.phase === "unauthorized" || tr.phase === "error";
+      const showSyncAndDisconnect = tr.phase === "idle" || tr.phase === "syncing";
+      traktConnectBtn.style.display = showConnect ? "inline-block" : "none";
+      traktRefreshBtn.style.display = showSyncAndDisconnect ? "inline-block" : "none";
+      traktDisconnectBtn.style.display = showSyncAndDisconnect ? "inline-block" : "none";
+      traktRefreshBtn.disabled = tr.phase === "syncing";
+    }
+  }
+
+  function setLanguage(lang) {
+    if (lang === currentLang) return;
+    currentLang = lang;
+    setStoredLanguage(window.localStorage, currentLang);
+    applyStaticStrings();
+    if (lastEngineStatus) applyEngineStatus(lastEngineStatus);
+    renderTable();
+  }
+
+  langSwitch.querySelectorAll(".lang-btn").forEach((btn) => {
+    btn.addEventListener("click", () => setLanguage(btn.getAttribute("data-lang")));
+  });
+
+  tmdbRefreshBtn.addEventListener("click", async () => {
+    tmdbRefreshBtn.disabled = true;
+    try {
+      await fetch("/api/tmdb/refresh", { method: "POST" });
+    } catch (e) {
+      tmdbRefreshBtn.disabled = false;
+    }
+  });
+
+  omdbRefreshBtn.addEventListener("click", async () => {
+    omdbRefreshBtn.disabled = true;
+    try {
+      await fetch("/api/omdb/refresh", { method: "POST" });
+    } catch (e) {
+      omdbRefreshBtn.disabled = false;
+    }
+  });
+
+  traktConnectBtn.addEventListener("click", async () => {
+    traktConnectBtn.disabled = true;
+    try {
+      await fetch("/api/trakt/connect", { method: "POST" });
+      // Result (user code / verification URL) arrives via the next status broadcast.
+    } catch (e) {
+      traktConnectBtn.disabled = false;
+    }
+  });
+
+  traktRefreshBtn.addEventListener("click", async () => {
+    traktRefreshBtn.disabled = true;
+    try {
+      await fetch("/api/trakt/refresh", { method: "POST" });
+    } catch (e) {
+      traktRefreshBtn.disabled = false;
+    }
+  });
+
+  traktDisconnectBtn.addEventListener("click", async () => {
+    traktDisconnectBtn.disabled = true;
+    try {
+      await fetch("/api/trakt/disconnect", { method: "POST" });
+    } finally {
+      traktDisconnectBtn.disabled = false;
+    }
+  });
+
+  function markStatusBroken() {
+    const t = getStrings(currentLang);
+    tmdbStatusText.innerHTML = `<span class="phase-bad">${escapeHtml(t.connectionLost)}</span>`;
+    omdbStatusText.innerHTML = `<span class="phase-bad">${escapeHtml(t.connectionLost)}</span>`;
+  }
+
+  function handleMessage(data) {
+    if (data.type === "init") {
+      movieMap = new Map(data.movies.map((m) => [m.id, m]));
+      applyEngineStatus(data.engineStatus);
+      renderTable({ resetPaging: true });
+    } else if (data.type === "snapshot") {
+      // Atomic switch: complete replacement of the view in one go.
+      movieMap = new Map(data.movies.map((m) => [m.id, m]));
+      renderTable({ resetPaging: true });
+    } else if (data.type === "upsert") {
+      movieMap.set(data.id, data);
+      scheduleRender();
+    } else if (data.type === "ratings_reset") {
+      for (const id of data.ids) {
+        const m = movieMap.get(id);
+        if (m) {
+          m.rt = "TODO";
+          m.metacritic = "TODO";
+        }
+      }
+      scheduleRender();
+    } else if (data.type === "status") {
+      applyEngineStatus(data.engineStatus);
+    }
+  }
+
+  applyStaticStrings();
+
+  // Watchdog + active reconnect on visibility change/online event live in
+  // public/js/connection.js (with its own tests in tests/) - see there for
+  // the rationale (mobile background connection drops).
+  //
+  // staleMs/watchdogMs are ONLY meant for automated tests (see
+  // tests/e2e/), so the connection drops simulated there don't have to
+  // wait for the real production time windows (35s/10s). Without these
+  // query parameters, the default values from connection.js apply
+  // unchanged.
+  const testParams = new URLSearchParams(window.location.search);
+  const staleOverride = Number(testParams.get("staleMs"));
+  const watchdogOverride = Number(testParams.get("watchdogMs"));
+
+  const connection = createConnectionManager({
+    url: "/api/stream",
+    EventSourceImpl: EventSource,
+    documentRef: document,
+    windowRef: window,
+    ...(staleOverride > 0 ? { staleThresholdMs: staleOverride } : {}),
+    ...(watchdogOverride > 0 ? { watchdogIntervalMs: watchdogOverride } : {}),
+    onMessage: handleMessage,
+    onBroken: markStatusBroken,
+  });
+  window.__primeConnection = connection; // test hook, see tests/e2e/
+  connection.start();
+</script>
+</body>
+</html>
