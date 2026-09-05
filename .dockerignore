@@ -1,0 +1,10 @@
+node_modules
+data
+*.log
+.git
+.DS_Store
+tests
+playwright.config.js
+playwright-report
+test-results
+.e2e-cache

@@ -1,0 +1,22 @@
+{
+  "name": "prime-rt-finder",
+  "version": "1.0.0",
+  "description": "Findet Filme bei Amazon Prime Video (DE), die kostenlos im Abo streambar sind und bei Rotten Tomatoes ueber einer waehlbaren Schwelle bewertet sind.",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test tests/*.test.js",
+    "test:e2e": "playwright test",
+    "test:e2e:install": "playwright install --with-deps chromium webkit"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.62.1"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
