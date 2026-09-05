@@ -2,7 +2,7 @@ import express from "express";
 import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
-import { OmdbLimitError, isOmdbLimitResponse, parseOmdbPayload } from "./lib/omdb.js";
+import { OmdbLimitError, OmdbAuthError, isOmdbLimitResponse, isOmdbAuthError, parseOmdbPayload } from "./lib/omdb.js";
 import {
   extractWatchedImdbIds,
   isDeviceAuthorizationPending,
@@ -528,6 +528,9 @@ async function fetchOmdbRatings(imdbId) {
   const data = await r.json().catch(() => null);
   debugLog(`OMDb <- ${r.status} (${Date.now() - t0}ms) [${imdbId}] Response=${data?.Response} Error=${data?.Error ?? "-"}`);
 
+  if (isOmdbAuthError(r.status, data)) {
+    throw new OmdbAuthError(`OMDB_API_KEY was rejected by OMDb: "${data.Error}"`);
+  }
   if (isOmdbLimitResponse(r.status, data)) {
     const detail = data && data.Error ? `"${data.Error}"` : `HTTP ${r.status}`;
     throw new OmdbLimitError(`OMDb daily limit reached: ${detail}`);
@@ -920,6 +923,23 @@ async function processPendingRatings() {
         if (processed % 20 === 0) saveOmdbCache();
         await sleep(OMDB_REQUEST_DELAY_MS);
       } catch (err) {
+        if (err instanceof OmdbAuthError) {
+          // Distinct from OmdbLimitError on purpose: an invalid/revoked key
+          // will never resolve itself by waiting, unlike a daily limit. Still
+          // retries (the key might get fixed at any time), but the status
+          // message says so plainly instead of misleadingly claiming a
+          // temporary limit that's actually a permanent config problem.
+          const remaining = pendingIds.length - processed;
+          setOmdbStatus(
+            "error",
+            `${err.message} - fix OMDB_API_KEY, then use "Sync now" (${remaining} pending, retrying every ${OMDB_RETRY_INTERVAL_MINUTES} minute(s) meanwhile).`,
+            { processed, total: pendingIds.length, pending: remaining }
+          );
+          saveOmdbCache();
+          console.error(`[OMDb] ${err.message}`);
+          await sleepOrWake(OMDB_RETRY_INTERVAL_MS);
+          return true;
+        }
         if (err instanceof OmdbLimitError) {
           const remaining = pendingIds.length - processed;
           setOmdbStatus(
