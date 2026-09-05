@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseOmdbPayload, isOmdbLimitResponse } from "../lib/omdb.js";
+import { parseOmdbPayload, isOmdbLimitResponse, isOmdbAuthError } from "../lib/omdb.js";
 
 test("parseOmdbPayload: reads RT and Metacritic from a normal response", () => {
   const data = {
@@ -54,4 +54,21 @@ test("isOmdbLimitResponse: a normal 'not found' is NOT a limit error", () => {
 
 test("isOmdbLimitResponse: a normal successful response is not a limit error", () => {
   assert.equal(isOmdbLimitResponse(200, { Response: "True" }), false);
+});
+
+test("isOmdbAuthError: detects an invalid API key via its distinct Error text", () => {
+  assert.equal(isOmdbAuthError(401, { Response: "False", Error: "Invalid API key!" }), true);
+});
+
+test("isOmdbLimitResponse: an invalid API key is NOT a limit error, despite sharing HTTP 401", () => {
+  assert.equal(isOmdbLimitResponse(401, { Response: "False", Error: "Invalid API key!" }), false);
+});
+
+test("isOmdbAuthError: a genuine daily-limit 401 is not misclassified as an auth error", () => {
+  assert.equal(isOmdbAuthError(401, { Response: "False", Error: "Request limit reached!" }), false);
+});
+
+test("isOmdbAuthError: false for non-401 statuses and missing data", () => {
+  assert.equal(isOmdbAuthError(200, { Response: "False", Error: "Invalid API key!" }), false);
+  assert.equal(isOmdbAuthError(401, null), false);
 });
