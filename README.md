@@ -163,12 +163,17 @@ UI language, independently per browser:
 
 ## Result table: TODO / N/A / rating
 
-- **TODO** – the movie hasn't been checked against OMDb yet (or not again
-  since its TTL expired). All Prime movies appear in the table
-  immediately, even before their rating is known.
+- **TODO** – the movie has never been checked against OMDb yet. All Prime
+  movies appear in the table immediately, even before their rating is known.
 - **N/A** – the movie was checked, but OMDb has no Rotten Tomatoes or
   Metacritic rating on file for it.
-- **Number** – the actual rating (RT in %, Metacritic on a 0–100 scale).
+- **Number** – the actual rating (RT in %, Metacritic on a 0–100 scale). Once
+  its TTL (`OMDB_REFRESH_INTERVAL_HOURS`) expires, this number **stays
+  displayed** while a re-check is pending in the background - it does not
+  regress back to "TODO". When the daily OMDb quota is limited, movies that
+  have never been checked at all are always processed before due refreshes
+  of already-known ratings, so the visible backlog fills in first-time gaps
+  before re-confirming ratings that are merely a bit old.
 
 ## Filtering
 

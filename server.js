@@ -2,7 +2,15 @@ import express from "express";
 import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
-import { OmdbLimitError, OmdbAuthError, isOmdbLimitResponse, isOmdbAuthError, parseOmdbPayload } from "./lib/omdb.js";
+import {
+  OmdbLimitError,
+  OmdbAuthError,
+  isOmdbLimitResponse,
+  isOmdbAuthError,
+  parseOmdbPayload,
+  isRatingStale,
+  selectPendingOmdbIds,
+} from "./lib/omdb.js";
 import {
   extractWatchedImdbIds,
   isDeviceAuthorizationPending,
@@ -99,8 +107,10 @@ function wakeEngine() {
 // Two separate, provider-specific caches:
 //  - tmdbCatalog: title/year/genres/link, fully reloaded on an interval of
 //    TMDB_REFRESH_INTERVAL_HOURS. The switch happens ATOMICALLY (see below).
-//  - omdbRatings: RT and Metacritic rating per movie, "TODO" until checked,
-//    individually rechecked after OMDB_REFRESH_INTERVAL_HOURS.
+//  - omdbRatings: RT and Metacritic rating per movie, "TODO" until first
+//    checked. After OMDB_REFRESH_INTERVAL_HOURS a checked entry is flagged
+//    `needsRefresh` (keeping its last known rating visible) rather than
+//    reset back to "TODO" - see markStaleRatings/selectPendingOmdbIds.
 // ---------------------------------------------------------------------------
 let tmdbCatalog = { movies: {}, lastRefresh: 0 };
 let omdbRatings = { entries: {}, lastFullSync: null };
@@ -853,20 +863,26 @@ async function refreshTmdbCatalog() {
   broadcast("snapshot", { movies: buildAllMoviesView() });
 }
 
-/** Resets ratings older than OMDB_REFRESH_INTERVAL_HOURS back to "TODO". */
+/**
+ * Flags ratings older than OMDB_REFRESH_INTERVAL_HOURS as due for a
+ * re-check, via `needsRefresh` - deliberately does NOT reset rt/metacritic
+ * back to "TODO" (unlike a never-checked movie), so the table keeps showing
+ * the last known rating instead of regressing to a blank "TODO" for
+ * however long it takes the engine to get back around to it. This also lets
+ * selectPendingOmdbIds tell a genuine first-time gap apart from a stale
+ * refresh and prioritize the former when the daily OMDb quota is tight.
+ */
 function markStaleRatings() {
   const now = Date.now();
   let changed = 0;
   for (const entry of Object.values(omdbRatings.entries)) {
-    if (entry.checkedAt && now - new Date(entry.checkedAt).getTime() >= OMDB_REFRESH_INTERVAL_MS) {
-      entry.rt = "TODO";
-      entry.metacritic = "TODO";
-      entry.checkedAt = null;
+    if (!entry.needsRefresh && isRatingStale(entry.checkedAt, now, OMDB_REFRESH_INTERVAL_MS)) {
+      entry.needsRefresh = true;
       changed++;
     }
   }
   if (changed > 0) {
-    debugLog(`[OMDb] ${changed} rating(s) marked stale (TTL ${OMDB_REFRESH_INTERVAL_HOURS}h)`);
+    debugLog(`[OMDb] ${changed} rating(s) marked stale (TTL ${OMDB_REFRESH_INTERVAL_HOURS}h), kept visible until rechecked`);
     saveOmdbCache();
   }
   return changed > 0;
@@ -875,7 +891,9 @@ function markStaleRatings() {
 async function processPendingRatings() {
   if (!OMDB_API_KEY) return false;
 
-  const pendingIds = Object.keys(omdbRatings.entries).filter((id) => omdbRatings.entries[id].rt === "TODO");
+  // Never-checked movies first, stale-and-due-for-refresh ones after - see
+  // selectPendingOmdbIds and markStaleRatings.
+  const pendingIds = selectPendingOmdbIds(omdbRatings.entries);
   if (pendingIds.length === 0) return false;
 
   let processed = 0;
@@ -910,6 +928,7 @@ async function processPendingRatings() {
       entry.rt = null;
       entry.metacritic = null;
       entry.checkedAt = new Date().toISOString();
+      entry.needsRefresh = false;
       broadcast("upsert", buildMovieView(id));
       processed++;
     } else {
@@ -918,6 +937,7 @@ async function processPendingRatings() {
         entry.rt = rt;
         entry.metacritic = metacritic;
         entry.checkedAt = new Date().toISOString();
+        entry.needsRefresh = false;
         broadcast("upsert", buildMovieView(id));
         processed++;
         if (processed % 20 === 0) saveOmdbCache();
