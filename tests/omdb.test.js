@@ -125,9 +125,38 @@ test("splitPendingOmdbIds: separates genuine coverage gaps from optional stale r
     "2": { rt: "TODO", metacritic: "TODO" },
     "3": { rt: "TODO", metacritic: "TODO" },
     "4": { rt: null, metacritic: null, needsRefresh: true },
-    "5": { rt: 50, metacritic: 60 }, // fresh, up to date - excluded from both
+    "5": { rt: 50, metacritic: 60 }, // fresh, up to date - excluded from all tiers
   };
-  const { neverChecked, dueForRefresh } = splitPendingOmdbIds(entries);
+  const { neverChecked, dueForRefresh, metacriticOnly } = splitPendingOmdbIds(entries);
   assert.deepEqual(neverChecked, ["2", "3"]);
   assert.deepEqual(dueForRefresh, ["1", "4"]);
+  assert.deepEqual(metacriticOnly, []);
+});
+
+test("splitPendingOmdbIds: an entry that only still owes Metacritic is its own, lowest tier", () => {
+  const entries = {
+    "1": { rt: 83, metacritic: null, metacriticPending: true }, // RT known via the scraper, OMDb was rate-limited
+    "2": { rt: "TODO", metacritic: "TODO" },
+    "3": { rt: 70, metacritic: 65 },
+  };
+  const { neverChecked, dueForRefresh, metacriticOnly } = splitPendingOmdbIds(entries);
+  assert.deepEqual(neverChecked, ["2"]);
+  assert.deepEqual(dueForRefresh, []);
+  assert.deepEqual(metacriticOnly, ["1"]);
+});
+
+test("selectPendingOmdbIds: metacritic-only entries queue behind both other tiers", () => {
+  const entries = {
+    "1": { rt: 83, metacritic: null, metacriticPending: true },
+    "2": { rt: 91, metacritic: 74, needsRefresh: true },
+    "3": { rt: "TODO", metacritic: "TODO" },
+  };
+  assert.deepEqual(selectPendingOmdbIds(entries), ["3", "2", "1"]);
+});
+
+test("splitPendingOmdbIds: a stale entry that also owes Metacritic is only counted once", () => {
+  const entries = { "1": { rt: 83, metacritic: null, needsRefresh: true, metacriticPending: true } };
+  const { dueForRefresh, metacriticOnly } = splitPendingOmdbIds(entries);
+  assert.deepEqual(dueForRefresh, ["1"], "the stale tier wins - it re-fetches both ratings anyway");
+  assert.deepEqual(metacriticOnly, []);
 });
