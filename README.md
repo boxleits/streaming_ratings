@@ -96,6 +96,15 @@ Tomatoes movie page instead:
   Metacritic (that column stays "N/A"), and no daily quota anywhere in the
   loop.
 
+**When OMDb hits its daily limit with the scraper enabled**, the pass does
+*not* stop: OMDb is dropped for the rest of that pass and RT — which has no
+quota — keeps filling the column on its own. Movies processed that way get
+their RT score right away and are marked as still owing a Metacritic score
+(`metacriticPending` in `omdb-cache.json`), which a later pass fills in once
+the quota is back. Those entries are the lowest-priority tier in the queue,
+and their RT score is **not** re-scraped (it's already fresh) nor overwritten
+by OMDb's own RT value when the catch-up pass runs.
+
 ## Trakt: "Watched" status (optional)
 
 If `TRAKT_CLIENT_ID`/`TRAKT_CLIENT_SECRET` are set, a "Trakt" row appears

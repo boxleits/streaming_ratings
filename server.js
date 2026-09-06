@@ -1038,8 +1038,8 @@ async function processPendingRatings() {
   // selectPendingOmdbIds and markStaleRatings. neverCheckedTotal is used
   // below to tell a genuine coverage gap apart from a merely optional
   // refresh once the daily quota gets hit mid-pass.
-  const { neverChecked, dueForRefresh } = splitPendingOmdbIds(omdbRatings.entries);
-  const pendingIds = [...neverChecked, ...dueForRefresh];
+  const { neverChecked, dueForRefresh, metacriticOnly } = splitPendingOmdbIds(omdbRatings.entries);
+  const pendingIds = [...neverChecked, ...dueForRefresh, ...metacriticOnly];
   const neverCheckedTotal = neverChecked.length;
   if (pendingIds.length === 0) return false;
 
@@ -1062,6 +1062,11 @@ async function processPendingRatings() {
   }
 
   let processed = 0;
+  // Set once OMDb reports its daily limit. With the RT scraper enabled this
+  // does NOT end the pass any more: OMDb is simply skipped for the rest of
+  // it while RT - which has no quota - keeps filling the column. Without
+  // the scraper there's nothing left to do, so the pass still backs off.
+  let omdbLimited = false;
   setOmdbStatus("checking_ratings", `Checking ratings: 0 / ${pendingIds.length}`, {
     processed: 0,
     total: pendingIds.length,
@@ -1099,10 +1104,13 @@ async function processPendingRatings() {
     } else {
       // Rotten Tomatoes first when enabled: it's the primary RT source and
       // never throws (see fetchRtScore), so OMDb's limit/auth handling
-      // below stays exactly as it was. Only movies with a known slug cost a
-      // request - the rest fall straight through to OMDb.
+      // below stays exactly as it was. Only movies with a known slug AND an
+      // actually unknown/stale RT score cost a request - entries queued
+      // solely because they still owe a Metacritic score keep the RT value
+      // they already have instead of being re-scraped every pass.
       let scrapedRt = null;
-      if (RT_SCRAPE_ENABLED && rtSlugs[entry.imdbId]) {
+      const rtWanted = entry.rt === "TODO" || entry.needsRefresh;
+      if (RT_SCRAPE_ENABLED && rtWanted && rtSlugs[entry.imdbId]) {
         const rtResult = await fetchRtScore(entry.imdbId);
         await sleep(RT_REQUEST_DELAY_MS); // deliberately slow: this is someone else's website
         if (rtResult.unavailable && !OMDB_API_KEY) {
@@ -1122,20 +1130,46 @@ async function processPendingRatings() {
         scrapedRt = rtResult.score;
       }
 
+      // Bank the scraped score BEFORE talking to OMDb. An OMDb failure below
+      // must never discard a score RT already gave us - that's what made a
+      // rate-limited OMDb key stall the scraper completely: the exception
+      // fired before the assignment, so every pass re-scraped the same movie
+      // and threw the result away.
+      if (scrapedRt !== null) entry.rt = scrapedRt;
+
+      // OMDb is skipped entirely once it has reported its daily limit in
+      // this pass (or when no key is configured at all) - the RT scraper has
+      // no quota and carries on without it.
+      const omdbUsable = Boolean(OMDB_API_KEY) && !omdbLimited;
+
       try {
-        // OMDb still supplies Metacritic (and the RT fallback) whenever a
-        // key is configured. With scraping on and no OMDb key at all, it's
-        // skipped entirely - which is the point of the scraper as an
-        // alternative: no daily quota in the loop.
-        const omdb = OMDB_API_KEY ? await fetchOmdbRatings(entry.imdbId) : { rt: null, metacritic: null };
-        entry.rt = scrapedRt ?? omdb.rt;
-        entry.metacritic = omdb.metacritic;
+        // OMDb still supplies Metacritic (and the RT fallback) whenever it's
+        // usable. Without it, only Metacritic is left owed - recorded via
+        // metacriticPending so a later pass can fill it in once quota is
+        // back, without the entry counting as an RT coverage gap.
+        const omdb = omdbUsable ? await fetchOmdbRatings(entry.imdbId) : null;
+        if (omdb) {
+          // The scraper is the primary RT source, so OMDb's RT value must
+          // not overwrite a scraped one - including on a Metacritic-only
+          // catch-up pass, where the scrape was deliberately skipped because
+          // the stored RT score is still fresh. Letting OMDb win there would
+          // undo the scraper's work (and often blank the column, since OMDb
+          // has no RT value for many titles).
+          const keepScrapedRt = RT_SCRAPE_ENABLED && !rtWanted;
+          entry.rt = scrapedRt ?? (keepScrapedRt ? entry.rt : omdb.rt);
+          entry.metacritic = omdb.metacritic;
+          entry.metacriticPending = false;
+        } else {
+          entry.rt = scrapedRt ?? (entry.rt === "TODO" ? null : entry.rt);
+          if (entry.metacritic === "TODO") entry.metacritic = null;
+          entry.metacriticPending = Boolean(OMDB_API_KEY);
+        }
         entry.checkedAt = new Date().toISOString();
         entry.needsRefresh = false;
         broadcast("upsert", buildMovieView(id));
         processed++;
         if (processed % 20 === 0) saveOmdbCache();
-        if (OMDB_API_KEY) await sleep(OMDB_REQUEST_DELAY_MS);
+        if (omdb) await sleep(OMDB_REQUEST_DELAY_MS);
       } catch (err) {
         if (err instanceof OmdbAuthError) {
           // Distinct from OmdbLimitError on purpose: an invalid/revoked key
@@ -1156,36 +1190,54 @@ async function processPendingRatings() {
         }
         if (err instanceof OmdbLimitError) {
           const remaining = pendingIds.length - processed;
-          // pendingIds is ordered never-checked-first (see above), so as
-          // long as `processed` hasn't yet worked through all of
-          // neverCheckedTotal, some of `remaining` are genuine coverage
-          // gaps; anything beyond that is only the optional stale-refresh
-          // tail. Only the former is treated as a "problem" worth a red
-          // status - a backlog of pure refreshes of already-known ratings
-          // is a background nice-to-have, not something to alarm about.
-          const remainingNeverChecked = Math.max(0, neverCheckedTotal - processed);
-          if (remainingNeverChecked > 0) {
-            setOmdbStatus(
-              "waiting_for_limit_reset",
-              `OMDb daily limit reached (${remaining} pending, ${remainingNeverChecked} never checked). Next attempt in ${OMDB_RETRY_INTERVAL_MINUTES} minute(s) ...`,
-              { processed, total: pendingIds.length, pending: remaining }
-            );
+
+          if (RT_SCRAPE_ENABLED) {
+            // The scraper has no quota, so a limited OMDb is no reason to
+            // stop: drop OMDb for the rest of this pass and keep going on RT
+            // alone. This movie still gets recorded below with whatever RT
+            // gave us; only its Metacritic stays owed.
+            omdbLimited = true;
+            entry.rt = scrapedRt ?? (entry.rt === "TODO" ? null : entry.rt);
+            if (entry.metacritic === "TODO") entry.metacritic = null;
+            entry.metacriticPending = true;
+            entry.checkedAt = new Date().toISOString();
+            entry.needsRefresh = false;
+            broadcast("upsert", buildMovieView(id));
+            processed++;
+            saveOmdbCache();
+            debugLog(`[OMDb] Daily limit reached - continuing this pass on Rotten Tomatoes only (${remaining} left)`);
           } else {
-            setOmdbStatus(
-              "stale_refresh_pending",
-              `Every movie already has a rating; OMDb daily limit reached while refreshing ${remaining} stale one(s) in the background. Next attempt in ${OMDB_RETRY_INTERVAL_MINUTES} minute(s).`,
-              { processed, total: pendingIds.length, pending: remaining }
+            // pendingIds is ordered never-checked-first (see above), so as
+            // long as `processed` hasn't yet worked through all of
+            // neverCheckedTotal, some of `remaining` are genuine coverage
+            // gaps; anything beyond that is only the optional stale-refresh
+            // tail. Only the former is treated as a "problem" worth a red
+            // status - a backlog of pure refreshes of already-known ratings
+            // is a background nice-to-have, not something to alarm about.
+            const remainingNeverChecked = Math.max(0, neverCheckedTotal - processed);
+            if (remainingNeverChecked > 0) {
+              setOmdbStatus(
+                "waiting_for_limit_reset",
+                `OMDb daily limit reached (${remaining} pending, ${remainingNeverChecked} never checked). Next attempt in ${OMDB_RETRY_INTERVAL_MINUTES} minute(s) ...`,
+                { processed, total: pendingIds.length, pending: remaining }
+              );
+            } else {
+              setOmdbStatus(
+                "stale_refresh_pending",
+                `Every movie already has a rating; OMDb daily limit reached while refreshing ${remaining} stale one(s) in the background. Next attempt in ${OMDB_RETRY_INTERVAL_MINUTES} minute(s).`,
+                { processed, total: pendingIds.length, pending: remaining }
+              );
+            }
+            saveOmdbCache();
+            debugLog(
+              `[OMDb] Limit reached, waiting ${OMDB_RETRY_INTERVAL_MINUTES}min (${remaining} pending, ${remainingNeverChecked} never checked)`
             );
+            // Wakeable: a manual TMDb sync (or, in principle, a future
+            // manual OMDb retry) can cut this wait short instead of forcing
+            // a full OMDB_RETRY_INTERVAL_MINUTES wait first.
+            await sleepOrWake(OMDB_RETRY_INTERVAL_MS);
+            return true; // the next engine tick retries the remaining ids (or prioritizes the TMDb sync)
           }
-          saveOmdbCache();
-          debugLog(
-            `[OMDb] Limit reached, waiting ${OMDB_RETRY_INTERVAL_MINUTES}min (${remaining} pending, ${remainingNeverChecked} never checked)`
-          );
-          // Wakeable: a manual TMDb sync (or, in principle, a future
-          // manual OMDb retry) can cut this wait short instead of forcing
-          // a full OMDB_RETRY_INTERVAL_MINUTES wait first.
-          await sleepOrWake(OMDB_RETRY_INTERVAL_MS);
-          return true; // the next engine tick retries the remaining ids (or prioritizes the TMDb sync)
         }
         console.error(`Error for movie ID ${id}:`, err.message);
         debugLog(`[OMDb] Error for ID ${id}: ${err.message}`);
@@ -1200,6 +1252,22 @@ async function processPendingRatings() {
   }
 
   saveOmdbCache();
+
+  if (omdbLimited) {
+    // The RT column is filled as far as this pass could take it, but OMDb
+    // still owes Metacritic for everything processed after the limit hit.
+    // Waiting out the retry interval before the next pass keeps that retry
+    // from turning into a tight loop (and, with it, needless RT traffic).
+    const owed = Object.values(omdbRatings.entries).filter((e) => e.metacriticPending).length;
+    setOmdbStatus(
+      "stale_refresh_pending",
+      `Ratings up to date via Rotten Tomatoes (${processed} checked). OMDb daily limit reached - ${owed} Metacritic score(s) still owed, next attempt in ${OMDB_RETRY_INTERVAL_MINUTES} minute(s).`,
+      { lastFullSync: new Date().toISOString(), pending: owed }
+    );
+    await sleepOrWake(OMDB_RETRY_INTERVAL_MS);
+    return true;
+  }
+
   setOmdbStatus("idle", `All ratings up to date (${processed} checked).`, {
     lastFullSync: new Date().toISOString(),
     pending: 0,
