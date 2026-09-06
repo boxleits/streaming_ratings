@@ -306,6 +306,11 @@
             <div class="status-text" id="omdbStatusText">Connecting ...</div>
             <button id="omdbRefreshBtn" class="sync-btn" disabled>Sync now</button>
           </div>
+          <div class="status-row" id="rtStatusRow" style="display:none;">
+            <div class="status-provider">RT</div>
+            <div class="status-text" id="rtStatusText"></div>
+            <button id="rtRefreshBtn" class="sync-btn">Sync now</button>
+          </div>
           <div class="status-row" id="traktStatusRow" style="display:none;">
             <div class="status-provider">Trakt</div>
             <div class="status-text" id="traktStatusText"></div>
@@ -384,6 +389,9 @@
   const omdbStatusText = document.getElementById("omdbStatusText");
   const tmdbRefreshBtn = document.getElementById("tmdbRefreshBtn");
   const omdbRefreshBtn = document.getElementById("omdbRefreshBtn");
+  const rtStatusRow = document.getElementById("rtStatusRow");
+  const rtStatusText = document.getElementById("rtStatusText");
+  const rtRefreshBtn = document.getElementById("rtRefreshBtn");
   const traktStatusRow = document.getElementById("traktStatusRow");
   const traktStatusText = document.getElementById("traktStatusText");
   const traktConnectBtn = document.getElementById("traktConnectBtn");
@@ -448,6 +456,7 @@
     subtitleText.textContent = t.subtitle;
     tmdbRefreshBtn.textContent = t.syncNow;
     omdbRefreshBtn.textContent = t.syncNow;
+    rtRefreshBtn.textContent = t.syncNow;
     clearFiltersBtn.textContent = t.clearFilters;
 
     document.querySelectorAll("[data-label]").forEach((el) => {
@@ -644,6 +653,20 @@
       `<span class="${phaseClass(om.phase)}">${escapeHtml(omdbMessage)}</span>` + `<span class="status-meta">${omdbExtra}</span>`;
     omdbRefreshBtn.disabled = om.phase === "checking_ratings" || om.phase === "waiting_for_limit_reset";
 
+    // The RT row only exists when the (opt-in) scraper is enabled server-side.
+    const rt = status.rt;
+    if (!rt || !rt.configured) {
+      rtStatusRow.style.display = "none";
+    } else {
+      rtStatusRow.style.display = "grid";
+      const rtMessage = localizePhaseMessage("rt", rt, currentLang);
+      let rtExtra = escapeHtml(t.lastFullSyncLabel(formatLocalizedDate(rt.lastSync, currentLang)));
+      if (rt.phase === "scraping") rtExtra += ` &nbsp;·&nbsp; ${escapeHtml(t.pendingSuffix(rt.pending ?? 0))}`;
+      rtStatusText.innerHTML =
+        `<span class="${phaseClass(rt.phase)}">${escapeHtml(rtMessage)}</span>` + `<span class="status-meta">${rtExtra}</span>`;
+      rtRefreshBtn.disabled = rt.phase === "scraping";
+    }
+
     const tr = status.trakt;
     if (!tr || !tr.configured) {
       traktStatusRow.style.display = "none";
@@ -702,6 +725,15 @@
       await fetch("/api/omdb/refresh", { method: "POST" });
     } catch (e) {
       omdbRefreshBtn.disabled = false;
+    }
+  });
+
+  rtRefreshBtn.addEventListener("click", async () => {
+    rtRefreshBtn.disabled = true;
+    try {
+      await fetch("/api/rt/refresh", { method: "POST" });
+    } catch (e) {
+      rtRefreshBtn.disabled = false;
     }
   });
 

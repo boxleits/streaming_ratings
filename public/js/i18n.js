@@ -57,6 +57,10 @@ const STRINGS = {
       waiting_for_limit_reset: (d) => `Waiting for OMDb daily limit reset (${d.pending ?? 0} pending) ...`,
       stale_refresh_pending: () => "Every movie has a rating - refreshing stale ones in the background",
     },
+    rtPhase: {
+      idle: () => "Up to date",
+      scraping: (d) => `Fetching tomatometers (${d.pending ?? 0} queued) ...`,
+    },
     traktPhase: {
       unauthorized: () => "Not connected",
       awaiting_authorization: () => "Waiting for you to approve on trakt.tv ...",
@@ -113,6 +117,10 @@ const STRINGS = {
       waiting_for_limit_reset: (d) => `Warte auf OMDb-Limit-Reset (${d.pending ?? 0} ausstehend) ...`,
       stale_refresh_pending: () => "Alle Filme bewertet \u2013 aktualisiere veraltete Bewertungen im Hintergrund",
     },
+    rtPhase: {
+      idle: () => "Aktuell",
+      scraping: (d) => `Hole Tomatometer-Werte (${d.pending ?? 0} in Warteschlange) ...`,
+    },
     traktPhase: {
       unauthorized: () => "Nicht verbunden",
       awaiting_authorization: () => "Warte auf Best\u00e4tigung bei trakt.tv ...",
@@ -136,7 +144,7 @@ export function getStrings(lang) {
  */
 export function localizePhaseMessage(provider, statusData, lang) {
   const strings = getStrings(lang);
-  const table = { tmdb: strings.tmdbPhase, omdb: strings.omdbPhase, trakt: strings.traktPhase }[provider];
+  const table = { tmdb: strings.tmdbPhase, omdb: strings.omdbPhase, rt: strings.rtPhase, trakt: strings.traktPhase }[provider];
   const fn = table && table[statusData.phase];
   if (fn) return fn(statusData);
   return statusData.message || "";

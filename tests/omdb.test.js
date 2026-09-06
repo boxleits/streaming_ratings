@@ -154,6 +154,23 @@ test("selectPendingOmdbIds: metacritic-only entries queue behind both other tier
   assert.deepEqual(selectPendingOmdbIds(entries), ["3", "2", "1"]);
 });
 
+test("splitPendingOmdbIds: RT's own staleness flag queues an entry for a refresh too", () => {
+  const entries = {
+    "1": { rt: 83, metacritic: 70, rtNeedsRefresh: true }, // RT stale on its own, shorter TTL
+    "2": { rt: 60, metacritic: 55 }, // fresh on both
+  };
+  const { neverChecked, dueForRefresh, metacriticOnly } = splitPendingOmdbIds(entries);
+  assert.deepEqual(neverChecked, []);
+  assert.deepEqual(dueForRefresh, ["1"]);
+  assert.deepEqual(metacriticOnly, []);
+});
+
+test("splitPendingOmdbIds: an entry stale for both OMDb and RT is queued once, not twice", () => {
+  const entries = { "1": { rt: 83, metacritic: 70, needsRefresh: true, rtNeedsRefresh: true } };
+  assert.deepEqual(splitPendingOmdbIds(entries).dueForRefresh, ["1"]);
+  assert.deepEqual(selectPendingOmdbIds(entries), ["1"]);
+});
+
 test("splitPendingOmdbIds: a stale entry that also owes Metacritic is only counted once", () => {
   const entries = { "1": { rt: 83, metacritic: null, needsRefresh: true, metacriticPending: true } };
   const { dueForRefresh, metacriticOnly } = splitPendingOmdbIds(entries);
