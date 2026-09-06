@@ -12,6 +12,8 @@ import {
   selectPendingOmdbIds,
   splitPendingOmdbIds,
 } from "./lib/omdb.js";
+import { buildRtUrl, parseRtPage, isRtTransientFailure } from "./lib/rottentomatoes.js";
+import { buildRtIdQuery, parseRtIdBindings } from "./lib/wikidata.js";
 import {
   extractWatchedImdbIds,
   isDeviceAuthorizationPending,
@@ -38,6 +40,21 @@ const CACHE_DIR = process.env.CACHE_DIR || path.join(__dirname, "data");
 const PROVIDER_NAME = process.env.PROVIDER_NAME || "Amazon Prime Video";
 const DEBUG_MODE = /^(1|true|yes)$/i.test(process.env.DEBUG_MODE || "");
 
+// Rotten Tomatoes scraping: OPT-IN and off by default, because unlike every
+// other source here it is not a documented API (RT has no public one any
+// more) - it reads the public movie page and can break whenever RT changes
+// its markup. When enabled, it becomes the primary source for the RT score;
+// OMDb, if still configured, keeps supplying Metacritic and acts as the RT
+// fallback for anything the scraper couldn't resolve. See README.
+const RT_SCRAPE_ENABLED = /^(1|true|yes)$/i.test(process.env.RT_SCRAPE_ENABLED || "");
+const RT_REQUEST_DELAY_MS = parseInt(process.env.RT_REQUEST_DELAY_MS || "1500", 10);
+// Sent on every rottentomatoes.com/wikidata.org request. Wikidata requires a
+// descriptive one (it 403s generic clients); RT gets the same courtesy so
+// the traffic is at least honestly attributable.
+const RT_USER_AGENT =
+  process.env.RT_USER_AGENT ||
+  "prime-rt-finder/1.0 (self-hosted personal media dashboard; https://github.com/boxleits/streaming_ratings)";
+
 // Trakt is entirely optional: a single, server-wide account (not per-user -
 // this app has no login system). If unset, the "Watched" column just stays
 // "N/A" for everyone and the Trakt status row is hidden client-side.
@@ -55,6 +72,12 @@ const SUPPORTED_LANGUAGES = { en: "en-US", de: "de-DE" };
 const TMDB_BASE = "https://api.themoviedb.org/3";
 const OMDB_BASE = "https://www.omdbapi.com/";
 const TRAKT_BASE = "https://api.trakt.tv";
+const WIKIDATA_SPARQL_BASE = "https://query.wikidata.org/sparql";
+// How many IMDb ids go into one Wikidata SPARQL query. The point of the
+// Wikidata step is that it's batched - the RT page fetch itself is
+// unavoidably per-movie, but the id mapping needs only a handful of calls
+// for an entire catalog.
+const WIKIDATA_BATCH_SIZE = 200;
 const TMDB_REFRESH_INTERVAL_MS = TMDB_REFRESH_INTERVAL_HOURS * 3600 * 1000;
 const OMDB_REFRESH_INTERVAL_MS = OMDB_REFRESH_INTERVAL_HOURS * 3600 * 1000;
 const OMDB_RETRY_INTERVAL_MS = OMDB_RETRY_INTERVAL_MINUTES * 60 * 1000;
@@ -69,6 +92,12 @@ const OMDB_CACHE_FILE = path.join(CACHE_DIR, "omdb-cache.json");
 // IMDb ids, no more sensitive than the other caches.
 const TRAKT_AUTH_FILE = path.join(CACHE_DIR, "trakt-auth.json");
 const TRAKT_WATCHED_FILE = path.join(CACHE_DIR, "trakt-watched.json");
+// IMDb id -> Rotten Tomatoes slug, resolved via Wikidata. Cached separately
+// and permanently: the mapping is a stable fact about a film, so it never
+// needs re-resolving even when the score itself is rechecked. A `null` value
+// is a remembered "Wikidata has no RT id for this one", so we don't ask
+// again on every pass.
+const RT_SLUG_CACHE_FILE = path.join(CACHE_DIR, "rt-slug-cache.json");
 
 function debugLog(...args) {
   if (!DEBUG_MODE) return;
@@ -157,8 +186,32 @@ function saveOmdbCache() {
   }
 }
 
+// imdbId -> "m/<slug>" | null (null = Wikidata knows no RT id for it).
+let rtSlugs = {};
+
+function loadRtSlugCache() {
+  try {
+    if (fs.existsSync(RT_SLUG_CACHE_FILE)) {
+      rtSlugs = JSON.parse(fs.readFileSync(RT_SLUG_CACHE_FILE, "utf-8"));
+      debugLog(`RT slug cache loaded: ${Object.keys(rtSlugs).length} entries`);
+    }
+  } catch (err) {
+    console.error("Could not load RT slug cache, starting empty:", err.message);
+    rtSlugs = {};
+  }
+}
+function saveRtSlugCache() {
+  try {
+    fs.mkdirSync(CACHE_DIR, { recursive: true });
+    fs.writeFileSync(RT_SLUG_CACHE_FILE, JSON.stringify(rtSlugs));
+  } catch (err) {
+    console.error("Could not save RT slug cache:", err.message);
+  }
+}
+
 loadTmdbCache();
 loadOmdbCache();
+if (RT_SCRAPE_ENABLED) loadRtSlugCache();
 
 // ---------------------------------------------------------------------------
 // Trakt: single, server-wide account (see comment near TRAKT_CLIENT_ID).
@@ -341,6 +394,7 @@ app.get("/api/status", (req, res) => {
   res.json({
     tmdbConfigured: Boolean(TMDB_API_KEY),
     omdbConfigured: Boolean(OMDB_API_KEY),
+    rtScrapeEnabled: RT_SCRAPE_ENABLED,
     traktConfigured: TRAKT_CONFIGURED,
     debugMode: DEBUG_MODE,
     providerName: PROVIDER_NAME,
@@ -358,8 +412,8 @@ app.post("/api/tmdb/refresh", (req, res) => {
 });
 
 app.post("/api/omdb/refresh", (req, res) => {
-  if (!OMDB_API_KEY) {
-    return res.status(400).json({ error: "OMDB_API_KEY is not set." });
+  if (!OMDB_API_KEY && !RT_SCRAPE_ENABLED) {
+    return res.status(400).json({ error: "Neither OMDB_API_KEY nor RT_SCRAPE_ENABLED is set." });
   }
   if (engineStatus.omdb.phase === "checking_ratings" || engineStatus.omdb.phase === "waiting_for_limit_reset") {
     return res.json({ ok: true, alreadyRunning: true });
@@ -550,6 +604,92 @@ async function fetchOmdbRatings(imdbId) {
   }
 
   return parseOmdbPayload(r.ok, data);
+}
+
+// ---------------------------------------------------------------------------
+// Rotten Tomatoes (opt-in, RT_SCRAPE_ENABLED): a two-step, best-effort
+// source that exists because RT has no public API.
+//
+//  1. Wikidata resolves IMDb ids -> RT slugs, BATCHED (one query per
+//     WIKIDATA_BATCH_SIZE ids), and the mapping is cached permanently.
+//  2. The RT page for a slug is fetched and parsed, unavoidably per movie,
+//     throttled by RT_REQUEST_DELAY_MS.
+//
+// Every failure mode here (no Wikidata entry, 404, changed markup, network
+// error) resolves to "no score" rather than an exception, so a broken
+// scraper degrades to OMDb/"N/A" instead of stalling the engine.
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolves and caches RT slugs for any of `imdbIds` not already known.
+ * Returns false if Wikidata was unreachable/refused, so the caller can tell
+ * "no slug because Wikidata doesn't have one" (a fact worth caching) apart
+ * from "no slug because the lookup itself failed" (must not be cached, and
+ * must not be recorded as a missing rating).
+ */
+async function resolveRtSlugs(imdbIds) {
+  const unknown = imdbIds.filter((id) => id && !(id in rtSlugs));
+  if (unknown.length === 0) return true;
+
+  for (let i = 0; i < unknown.length; i += WIKIDATA_BATCH_SIZE) {
+    const batch = unknown.slice(i, i + WIKIDATA_BATCH_SIZE);
+    const query = buildRtIdQuery(batch);
+    if (!query) continue;
+
+    const url = `${WIKIDATA_SPARQL_BASE}?format=json&query=${encodeURIComponent(query)}`;
+    const t0 = Date.now();
+    debugLog(`Wikidata GET sparql [${batch.length} ids]`);
+    try {
+      const r = await fetch(url, { headers: { Accept: "application/sparql-results+json", "User-Agent": RT_USER_AGENT } });
+      debugLog(`Wikidata <- ${r.status} (${Date.now() - t0}ms) [${batch.length} ids]`);
+      if (!r.ok) return false; // leave them unresolved; next pass tries again
+      const data = await r.json().catch(() => null);
+      const found = parseRtIdBindings(data);
+      for (const id of batch) {
+        // Remember misses as null too, so a film Wikidata simply doesn't
+        // cover doesn't get re-queried on every single pass.
+        rtSlugs[id] = found[id] ?? null;
+      }
+      saveRtSlugCache();
+    } catch (err) {
+      debugLog(`[RT] Wikidata batch failed: ${err.message}`);
+      return false; // network trouble - stop early, retry on the next pass
+    }
+  }
+  return true;
+}
+
+/**
+ * Fetches the RT page for one IMDb id. Returns `{ score, unavailable }`:
+ * `score` is the tomatometer or null, and `unavailable` distinguishes "RT
+ * wouldn't answer us just now" from "RT answered, there's simply no score" -
+ * only the latter may be recorded as a checked "N/A" (see
+ * isRtTransientFailure).
+ */
+async function fetchRtScore(imdbId) {
+  const slug = rtSlugs[imdbId];
+  if (!slug) return { score: null, unavailable: false };
+
+  const url = buildRtUrl(slug);
+  const t0 = Date.now();
+  debugLog(`RT GET ${url}`);
+  try {
+    const r = await fetch(url, { headers: { "User-Agent": RT_USER_AGENT, Accept: "text/html" } });
+    if (!r.ok) {
+      debugLog(`RT <- ${r.status} (${Date.now() - t0}ms) [${imdbId} ${slug}]`);
+      return { score: null, unavailable: isRtTransientFailure(r.status) };
+    }
+    const html = await r.text();
+    const { tomatometer } = parseRtPage(html);
+    debugLog(`RT <- ${r.status} (${Date.now() - t0}ms) [${imdbId} ${slug}] tomatometer=${tomatometer ?? "-"}`);
+    // A page that loaded but yielded nothing is treated as "no score on
+    // file". If RT changed its markup, that's indistinguishable from here -
+    // which is why the scraper is opt-in and documented as best-effort.
+    return { score: tomatometer, unavailable: false };
+  } catch (err) {
+    debugLog(`[RT] Fetch failed for ${imdbId} (${slug}): ${err.message}`);
+    return { score: null, unavailable: true };
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -892,7 +1032,7 @@ function markStaleRatings() {
 }
 
 async function processPendingRatings() {
-  if (!OMDB_API_KEY) return false;
+  if (!OMDB_API_KEY && !RT_SCRAPE_ENABLED) return false;
 
   // Never-checked movies first, stale-and-due-for-refresh ones after - see
   // selectPendingOmdbIds and markStaleRatings. neverCheckedTotal is used
@@ -902,6 +1042,24 @@ async function processPendingRatings() {
   const pendingIds = [...neverChecked, ...dueForRefresh];
   const neverCheckedTotal = neverChecked.length;
   if (pendingIds.length === 0) return false;
+
+  // Resolve the RT slugs for this whole pass up front, in batches, so the
+  // per-movie loop below only ever does the (unavoidable) page fetch.
+  // Movies whose IMDb id is still unknown at this point get their slug on
+  // the next pass, once fetchImdbId below has filled it in.
+  if (RT_SCRAPE_ENABLED) {
+    const slugsResolved = await resolveRtSlugs(pendingIds.map((id) => omdbRatings.entries[id]?.imdbId).filter(Boolean));
+    if (!slugsResolved && !OMDB_API_KEY) {
+      // Scraping is the only configured source and its id lookup is down.
+      // Backing off beats working through the whole list recording "N/A"s
+      // we never actually confirmed.
+      setOmdbStatus("error", `Wikidata (Rotten Tomatoes id lookup) is unreachable - retrying in ${OMDB_RETRY_INTERVAL_MINUTES} minute(s).`, {
+        pending: pendingIds.length,
+      });
+      await sleepOrWake(OMDB_RETRY_INTERVAL_MS);
+      return true;
+    }
+  }
 
   let processed = 0;
   setOmdbStatus("checking_ratings", `Checking ratings: 0 / ${pendingIds.length}`, {
@@ -939,16 +1097,45 @@ async function processPendingRatings() {
       broadcast("upsert", buildMovieView(id));
       processed++;
     } else {
+      // Rotten Tomatoes first when enabled: it's the primary RT source and
+      // never throws (see fetchRtScore), so OMDb's limit/auth handling
+      // below stays exactly as it was. Only movies with a known slug cost a
+      // request - the rest fall straight through to OMDb.
+      let scrapedRt = null;
+      if (RT_SCRAPE_ENABLED && rtSlugs[entry.imdbId]) {
+        const rtResult = await fetchRtScore(entry.imdbId);
+        await sleep(RT_REQUEST_DELAY_MS); // deliberately slow: this is someone else's website
+        if (rtResult.unavailable && !OMDB_API_KEY) {
+          // RT is the only source here and it's refusing/failing right now.
+          // Leave this movie pending instead of writing a "checked, N/A"
+          // that would stand until OMDB_REFRESH_INTERVAL_HOURS expires.
+          const remaining = pendingIds.length - processed;
+          setOmdbStatus("error", `Rotten Tomatoes is currently unreachable (${remaining} pending). Next attempt in ${OMDB_RETRY_INTERVAL_MINUTES} minute(s).`, {
+            processed,
+            total: pendingIds.length,
+            pending: remaining,
+          });
+          saveOmdbCache();
+          await sleepOrWake(OMDB_RETRY_INTERVAL_MS);
+          return true;
+        }
+        scrapedRt = rtResult.score;
+      }
+
       try {
-        const { rt, metacritic } = await fetchOmdbRatings(entry.imdbId);
-        entry.rt = rt;
-        entry.metacritic = metacritic;
+        // OMDb still supplies Metacritic (and the RT fallback) whenever a
+        // key is configured. With scraping on and no OMDb key at all, it's
+        // skipped entirely - which is the point of the scraper as an
+        // alternative: no daily quota in the loop.
+        const omdb = OMDB_API_KEY ? await fetchOmdbRatings(entry.imdbId) : { rt: null, metacritic: null };
+        entry.rt = scrapedRt ?? omdb.rt;
+        entry.metacritic = omdb.metacritic;
         entry.checkedAt = new Date().toISOString();
         entry.needsRefresh = false;
         broadcast("upsert", buildMovieView(id));
         processed++;
         if (processed % 20 === 0) saveOmdbCache();
-        await sleep(OMDB_REQUEST_DELAY_MS);
+        if (OMDB_API_KEY) await sleep(OMDB_REQUEST_DELAY_MS);
       } catch (err) {
         if (err instanceof OmdbAuthError) {
           // Distinct from OmdbLimitError on purpose: an invalid/revoked key
