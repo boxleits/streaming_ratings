@@ -20,8 +20,12 @@ regardless of whether a browser is currently connected:
   browser, and includes movie titles and genre names — not just interface
   labels. See "Language switching" below.
 
-It does **not** scrape justwatch.com — both data sources used here offer
-official, publicly documented APIs.
+It does **not** scrape justwatch.com — the catalog and rating sources it
+uses by default (TMDb, OMDb, Trakt) all offer official, publicly documented
+APIs. The one exception is the **optional, off-by-default Rotten Tomatoes
+scraper** (`RT_SCRAPE_ENABLED`, see below), which exists only because Rotten
+Tomatoes has no public API at all any more; enabling it is a deliberate
+choice with the trade-offs spelled out in its own section.
 
 ## Required API keys
 
@@ -36,7 +40,10 @@ official, publicly documented APIs.
 | Variable                      | Required | Default                | Description |
 |--------------------------------|----------|--------------------------|--------------|
 | `TMDB_API_KEY`                 | yes      | –                         | TMDb v3 API key |
-| `OMDB_API_KEY`                 | yes*     | –                         | OMDb API key. Without it, the catalog still works, but RT/Metacritic stay permanently "TODO". |
+| `OMDB_API_KEY`                 | yes*     | –                         | OMDb API key. Without it (and without `RT_SCRAPE_ENABLED`), the catalog still works, but RT/Metacritic stay permanently "TODO". |
+| `RT_SCRAPE_ENABLED`            | no       | `false`                   | `true`/`1` enables the optional Rotten Tomatoes scraper as the primary RT source — see "Rotten Tomatoes without OMDb" below. Works with or without an OMDb key. |
+| `RT_REQUEST_DELAY_MS`          | no       | `1500`                    | Wait time between individual rottentomatoes.com page requests. Deliberately slow — don't lower it without reason. |
+| `RT_USER_AGENT`                | no       | a descriptive default     | User-Agent sent to Wikidata/RT. Wikidata rejects generic clients, so keep it descriptive. |
 | `TRAKT_CLIENT_ID`              | no       | –                         | Trakt API app Client ID. Leave both Trakt vars unset to disable the feature entirely (the "Watched" column and Trakt status row are hidden). |
 | `TRAKT_CLIENT_SECRET`          | no       | –                         | Trakt API app Client Secret. Needed together with `TRAKT_CLIENT_ID` for the device-code OAuth flow. |
 | `TRAKT_REFRESH_INTERVAL_HOURS` | no       | `24`                      | How often the watched-history sync re-runs once connected |
@@ -49,6 +56,45 @@ official, publicly documented APIs.
 | `PROVIDER_NAME`                | no       | `Amazon Prime Video`      | TMDb provider name, exactly as it appears in TMDb's provider list |
 | `CACHE_DIR`                    | no       | `/app/data`               | Directory for the cache files (see below) |
 | `DEBUG_MODE`                   | no       | `false`                   | `true`/`1` enables detailed console logging of every TMDb/OMDb/Trakt request |
+
+## Rotten Tomatoes without OMDb (optional, `RT_SCRAPE_ENABLED`)
+
+Rotten Tomatoes has **no public API** any more, and OMDb's free tier caps
+you at 1000 requests/day — which on a large catalog means the RT column can
+take days to fill and never really catches up. As an alternative, setting
+`RT_SCRAPE_ENABLED=true` reads the tomatometer off the public Rotten
+Tomatoes movie page instead:
+
+1. **Wikidata** resolves IMDb ids → RT slugs (property `P1258`), **batched**
+   — one SPARQL query per 200 ids, so mapping an entire catalog costs a
+   handful of requests, not one per movie. The mapping is cached
+   permanently in `rt-slug-cache.json` (it's a stable fact about a film),
+   including remembered misses, so nothing is looked up twice.
+2. The RT page for each slug is then fetched and parsed, throttled by
+   `RT_REQUEST_DELAY_MS` (1.5s by default).
+
+**This is a scraper, and it is opt-in for a reason:**
+
+- There is no API contract. When RT changes its markup, this breaks. The
+  parser tries several known markup variants and, if all fail, reports "no
+  rating" rather than crashing the engine — so the failure mode is missing
+  ratings, not downtime.
+- Scraping a site you don't own sits in a grey area with respect to its
+  terms of service. That's your call to make for your own deployment; it is
+  why this ships disabled by default.
+- A transient failure (RT throttling you, Wikidata unreachable) is
+  explicitly **not** recorded as "checked, no rating" — the movie stays
+  pending and the engine backs off for `OMDB_RETRY_INTERVAL_MINUTES`,
+  so an outage can't silently turn hundreds of movies into false "N/A"s.
+
+**Combining with OMDb:** the two are independent.
+
+- `RT_SCRAPE_ENABLED` **and** `OMDB_API_KEY`: the scraper is the primary RT
+  source, OMDb supplies Metacritic and acts as the RT fallback for anything
+  the scraper couldn't resolve.
+- `RT_SCRAPE_ENABLED` **without** `OMDB_API_KEY`: RT scores only, no
+  Metacritic (that column stays "N/A"), and no daily quota anywhere in the
+  loop.
 
 ## Trakt: "Watched" status (optional)
 
@@ -120,6 +166,10 @@ would discard all prior progress (catalog + already-checked movies).
   Watched status" below.
 - **`trakt-watched.json`** *(only if Trakt is configured)* – the derived
   list of watched IMDb IDs, refreshed on `TRAKT_REFRESH_INTERVAL_HOURS`.
+- **`rt-slug-cache.json`** *(only if `RT_SCRAPE_ENABLED`)* – IMDb ID → Rotten
+  Tomatoes slug, resolved via Wikidata. Never expires (the mapping is a
+  stable fact about a film) and remembers misses too. Delete it to force a
+  full re-resolve.
 
 This decouples the data sources: a catalog refresh doesn't automatically
 trigger a recheck of all movies' OMDb ratings or a Trakt re-sync, and
@@ -259,6 +309,18 @@ duration), e.g.:
 [DEBUG 2026-08-14T10:15:04.180Z] OMDb <- 200 (178ms) [tt1234567] Response=True Error=-
 ```
 
+With `RT_SCRAPE_ENABLED=true`, the Rotten Tomatoes path logs too — useful
+for spotting a markup change (a `tomatometer=-` on an otherwise healthy
+`200` is the tell-tale sign that RT changed its page and the parser needs
+updating):
+
+```
+[DEBUG 2026-08-14T10:15:05.001Z] Wikidata GET sparql [200 ids]
+[DEBUG 2026-08-14T10:15:05.640Z] Wikidata <- 200 (639ms) [200 ids]
+[DEBUG 2026-08-14T10:15:05.700Z] RT GET https://www.rottentomatoes.com/m/the_matrix
+[DEBUG 2026-08-14T10:15:06.010Z] RT <- 200 (310ms) [tt0133093 m/the_matrix] tomatometer=83
+```
+
 ## Behavior when the OMDb daily limit is hit
 
 - The engine pauses rating checks and automatically retries every
@@ -281,6 +343,10 @@ keys required), against extracted, pure logic:
 
 - **`tests/omdb.test.js`** – OMDb response parsing (RT/Metacritic
   extraction) and daily-limit detection (`lib/omdb.js`).
+- **`tests/rottentomatoes.test.js`** – RT page parsing across every
+  supported markup variant plus the fail-soft paths (`lib/rottentomatoes.js`),
+  and the batched IMDb→RT-slug SPARQL query building/parsing
+  (`lib/wikidata.js`), including that non-`tt…` ids can't reach the query.
 - **`tests/filters.test.js`** – the result table's column-filter and sort
   logic (`public/js/filters.js`).
 - **`tests/connection.test.js`** – the SSE connection manager
@@ -445,6 +511,8 @@ server.js                    Express app + background engine (entry point)
 lib/
   omdb.js                    Pure OMDb response parsing / limit detection (tested, no network)
   trakt.js                   Pure Trakt response parsing / OAuth-flow status helpers (tested, no network)
+  rottentomatoes.js          Pure RT page parsing (multi-strategy, fail-soft) + failure classification (tested, no network)
+  wikidata.js                Pure SPARQL query building / result parsing for IMDb->RT slug mapping (tested, no network)
 public/
   index.html                 UI shell; loads the modules below via <script type="module">
   js/
