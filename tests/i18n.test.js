@@ -36,6 +36,15 @@ test("localizePhaseMessage: falls back to the raw server message for phases with
   assert.equal(msg, "TMDB_API_KEY is not set - engine paused.");
 });
 
+test("localizePhaseMessage: supports the rt provider, per language", () => {
+  const en = localizePhaseMessage("rt", { phase: "scraping", pending: 42 }, "en");
+  const de = localizePhaseMessage("rt", { phase: "scraping", pending: 42 }, "de");
+  assert.match(en, /42/);
+  assert.match(de, /42/);
+  assert.notEqual(en, de);
+  assert.equal(localizePhaseMessage("rt", { phase: "idle" }, "de"), "Aktuell");
+});
+
 test("localizePhaseMessage: supports the trakt provider too, per language", () => {
   const en = localizePhaseMessage("trakt", { phase: "awaiting_authorization" }, "en");
   const de = localizePhaseMessage("trakt", { phase: "awaiting_authorization" }, "de");

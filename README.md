@@ -43,6 +43,7 @@ choice with the trade-offs spelled out in its own section.
 | `OMDB_API_KEY`                 | yes*     | –                         | OMDb API key. Without it (and without `RT_SCRAPE_ENABLED`), the catalog still works, but RT/Metacritic stay permanently "TODO". |
 | `RT_SCRAPE_ENABLED`            | no       | `false`                   | `true`/`1` enables the optional Rotten Tomatoes scraper as the primary RT source — see "Rotten Tomatoes without OMDb" below. Works with or without an OMDb key. |
 | `RT_REQUEST_DELAY_MS`          | no       | `1500`                    | Wait time between individual rottentomatoes.com page requests. Deliberately slow — don't lower it without reason. |
+| `RT_REFRESH_INTERVAL_HOURS`    | no       | `24`                      | How old a tomatometer may get before it's re-scraped. Independent of `OMDB_REFRESH_INTERVAL_HOURS` — scraping has no quota, so RT can refresh far more often than Metacritic. |
 | `RT_USER_AGENT`                | no       | a descriptive default     | User-Agent sent to Wikidata/RT. Wikidata rejects generic clients, so keep it descriptive. |
 | `TRAKT_CLIENT_ID`              | no       | –                         | Trakt API app Client ID. Leave both Trakt vars unset to disable the feature entirely (the "Watched" column and Trakt status row are hidden). |
 | `TRAKT_CLIENT_SECRET`          | no       | –                         | Trakt API app Client Secret. Needed together with `TRAKT_CLIENT_ID` for the device-code OAuth flow. |
@@ -95,6 +96,17 @@ Tomatoes movie page instead:
 - `RT_SCRAPE_ENABLED` **without** `OMDB_API_KEY`: RT scores only, no
   Metacritic (that column stays "N/A"), and no daily quota anywhere in the
   loop.
+
+**Its own refresh cadence and its own "Sync now".** RT is not tied to
+`OMDB_REFRESH_INTERVAL_HOURS`: it has `RT_REFRESH_INTERVAL_HOURS` (24h by
+default, versus a week for OMDb), because scraping costs no quota and there's
+no reason to make a fresh tomatometer wait for Metacritic. The status panel
+gains an **RT** row with its own "Sync now" button (`POST /api/rt/refresh`)
+that, unlike OMDb's, does **not** blank the table back to "TODO" and does
+**not** touch OMDb — so re-scraping the whole catalog can't burn a single
+request of the daily quota. An entry queued purely by RT's clock likewise
+skips its OMDb call entirely, and leaves OMDb's own staleness timestamp
+alone, so Metacritic still goes stale on schedule.
 
 **When OMDb hits its daily limit with the scraper enabled**, the pass does
 *not* stop: OMDb is dropped for the rest of that pass and RT — which has no
@@ -285,7 +297,8 @@ network speed, especially on weaker CPUs like phones:
 
 ## Status display & manual sync
 
-Top right shows a panel per provider (TMDb / OMDb):
+Top right shows a panel per provider (TMDb / OMDb, plus **RT** when
+`RT_SCRAPE_ENABLED` and **Trakt** when Trakt is configured):
 
 - current phase (up to date / running / waiting for limit reset / error),
 - timestamp of the last full sync,
