@@ -372,6 +372,7 @@
     getStrings,
     localizePhaseMessage,
     formatLocalizedDate,
+    formatRatingTooltip,
     projectMovieForLocale,
     getStoredLanguage,
     setStoredLanguage,
@@ -502,13 +503,14 @@
       const rt = formatScoreDisplay(movie.rt);
       const meta = formatScoreDisplay(movie.metacritic);
       const watched = formatWatchedDisplay(movie.watched);
+      const ratingTooltip = formatRatingTooltip(movie.ratingCheckedAt, movie.ratingNeedsRefresh, currentLang);
       const tr = document.createElement("tr");
       tr.innerHTML = `
         <td class="col-title"><a href="${escapeHtml(movie.tmdbUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(movie.title)}</a></td>
         <td class="col-genre">${escapeHtml(movie.genres)}</td>
         <td class="col-year">${escapeHtml(movie.year)}</td>
-        <td class="col-score"><span class="${rt.cls}">${escapeHtml(rt.text)}${movie.rt !== "TODO" && movie.rt !== null ? "%" : ""}</span></td>
-        <td class="col-score"><span class="${meta.cls}">${escapeHtml(meta.text)}</span></td>
+        <td class="col-score" title="${escapeHtml(ratingTooltip)}"><span class="${rt.cls}">${escapeHtml(rt.text)}${movie.rt !== "TODO" && movie.rt !== null ? "%" : ""}</span></td>
+        <td class="col-score" title="${escapeHtml(ratingTooltip)}"><span class="${meta.cls}">${escapeHtml(meta.text)}</span></td>
         <td class="col-score"><span class="${watched.cls}">${escapeHtml(watched.text)}</span></td>
       `;
       resultBody.appendChild(tr);
@@ -608,7 +610,13 @@
   function phaseClass(phase) {
     if (phase === "error") return "phase-bad";
     if (phase === "waiting_for_limit_reset") return "phase-bad";
-    if (phase === "refreshing" || phase === "checking_ratings" || phase === "awaiting_authorization" || phase === "syncing") {
+    if (
+      phase === "refreshing" ||
+      phase === "checking_ratings" ||
+      phase === "awaiting_authorization" ||
+      phase === "syncing" ||
+      phase === "stale_refresh_pending"
+    ) {
       return "phase-working";
     }
     return "phase-ok";
@@ -629,7 +637,7 @@
     const om = status.omdb;
     const omdbMessage = localizePhaseMessage("omdb", om, currentLang);
     let omdbExtra = t.lastFullSyncLabel(formatLocalizedDate(om.lastFullSync, currentLang));
-    if (om.phase === "waiting_for_limit_reset" || om.phase === "checking_ratings") {
+    if (om.phase === "waiting_for_limit_reset" || om.phase === "checking_ratings" || om.phase === "stale_refresh_pending") {
       omdbExtra += ` &nbsp;·&nbsp; ${escapeHtml(t.pendingSuffix(om.pending ?? 0))}`;
     }
     omdbStatusText.innerHTML =
