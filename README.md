@@ -175,6 +175,10 @@ UI language, independently per browser:
   of already-known ratings, so the visible backlog fills in first-time gaps
   before re-confirming ratings that are merely a bit old.
 
+Hover over the RT or Metacritic cell of any row to see a tooltip with when
+that rating was last checked against OMDb (or that it hasn't been checked
+yet, or that a background refresh of it is currently pending).
+
 ## Filtering
 
 No free-text search field anymore — column filters only:
@@ -228,6 +232,15 @@ Top right shows a panel per provider (TMDb / OMDb):
 - timestamp of the last full sync,
 - while an OMDb check is running or waiting for a limit reset: number of
   movies still pending.
+
+The OMDb status turns **red** ("waiting for OMDb daily limit reset") only
+when movies that have **never** been checked at all are still stuck behind
+the limit - a genuine coverage gap. If every movie already has a rating and
+the daily limit is only delaying an optional background refresh of
+already-known, merely-stale ratings, the status shows as a normal
+in-progress state instead ("every movie has a rating - refreshing stale
+ones in the background") - not a problem, just a nice-to-have still
+catching up.
 
 Each "Sync now" button is grayed out while a sync is already running for
 that provider — an ongoing wait for a limit reset also counts as

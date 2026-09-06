@@ -10,6 +10,7 @@ import {
   parseOmdbPayload,
   isRatingStale,
   selectPendingOmdbIds,
+  splitPendingOmdbIds,
 } from "./lib/omdb.js";
 import {
   extractWatchedImdbIds,
@@ -239,6 +240,8 @@ function buildMovieView(id) {
     tmdbUrl: cat.tmdbUrl,
     rt: rating.rt,
     metacritic: rating.metacritic,
+    ratingCheckedAt: rating.checkedAt || null,
+    ratingNeedsRefresh: Boolean(rating.needsRefresh),
     watched,
   };
 }
@@ -892,8 +895,12 @@ async function processPendingRatings() {
   if (!OMDB_API_KEY) return false;
 
   // Never-checked movies first, stale-and-due-for-refresh ones after - see
-  // selectPendingOmdbIds and markStaleRatings.
-  const pendingIds = selectPendingOmdbIds(omdbRatings.entries);
+  // selectPendingOmdbIds and markStaleRatings. neverCheckedTotal is used
+  // below to tell a genuine coverage gap apart from a merely optional
+  // refresh once the daily quota gets hit mid-pass.
+  const { neverChecked, dueForRefresh } = splitPendingOmdbIds(omdbRatings.entries);
+  const pendingIds = [...neverChecked, ...dueForRefresh];
+  const neverCheckedTotal = neverChecked.length;
   if (pendingIds.length === 0) return false;
 
   let processed = 0;
@@ -962,18 +969,36 @@ async function processPendingRatings() {
         }
         if (err instanceof OmdbLimitError) {
           const remaining = pendingIds.length - processed;
-          setOmdbStatus(
-            "waiting_for_limit_reset",
-            `OMDb daily limit reached (${remaining} pending). Next attempt in ${OMDB_RETRY_INTERVAL_MINUTES} minute(s) ...`,
-            { processed, total: pendingIds.length, pending: remaining }
-          );
+          // pendingIds is ordered never-checked-first (see above), so as
+          // long as `processed` hasn't yet worked through all of
+          // neverCheckedTotal, some of `remaining` are genuine coverage
+          // gaps; anything beyond that is only the optional stale-refresh
+          // tail. Only the former is treated as a "problem" worth a red
+          // status - a backlog of pure refreshes of already-known ratings
+          // is a background nice-to-have, not something to alarm about.
+          const remainingNeverChecked = Math.max(0, neverCheckedTotal - processed);
+          if (remainingNeverChecked > 0) {
+            setOmdbStatus(
+              "waiting_for_limit_reset",
+              `OMDb daily limit reached (${remaining} pending, ${remainingNeverChecked} never checked). Next attempt in ${OMDB_RETRY_INTERVAL_MINUTES} minute(s) ...`,
+              { processed, total: pendingIds.length, pending: remaining }
+            );
+          } else {
+            setOmdbStatus(
+              "stale_refresh_pending",
+              `Every movie already has a rating; OMDb daily limit reached while refreshing ${remaining} stale one(s) in the background. Next attempt in ${OMDB_RETRY_INTERVAL_MINUTES} minute(s).`,
+              { processed, total: pendingIds.length, pending: remaining }
+            );
+          }
           saveOmdbCache();
-          debugLog(`[OMDb] Limit reached, waiting ${OMDB_RETRY_INTERVAL_MINUTES}min (${remaining} pending)`);
+          debugLog(
+            `[OMDb] Limit reached, waiting ${OMDB_RETRY_INTERVAL_MINUTES}min (${remaining} pending, ${remainingNeverChecked} never checked)`
+          );
           // Wakeable: a manual TMDb sync (or, in principle, a future
           // manual OMDb retry) can cut this wait short instead of forcing
           // a full OMDB_RETRY_INTERVAL_MINUTES wait first.
           await sleepOrWake(OMDB_RETRY_INTERVAL_MS);
-          return true; // the next engine tick retries the remaining TODOs (or prioritizes the TMDb sync)
+          return true; // the next engine tick retries the remaining ids (or prioritizes the TMDb sync)
         }
         console.error(`Error for movie ID ${id}:`, err.message);
         debugLog(`[OMDb] Error for ID ${id}: ${err.message}`);

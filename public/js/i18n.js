@@ -32,6 +32,9 @@ const STRINGS = {
     moviesCountSuffix: (n) => `${n} movies`,
     lastFullSyncLabel: (date) => `Last full sync: ${date}`,
     pendingSuffix: (n) => `${n} pending`,
+    ratingNeverChecked: "Not checked against OMDb yet",
+    ratingChecked: (date) => `OMDb rating checked: ${date}`,
+    ratingCheckedStale: (date) => `OMDb rating checked: ${date} (refresh pending)`,
     footerLine1:
       "Data sources: TMDb (catalog, availability, genres, movie page), OMDb (Rotten Tomatoes & Metacritic ratings).",
     footerLine2: "TODO = not checked yet \u00b7 N/A = checked, no rating available.",
@@ -52,6 +55,7 @@ const STRINGS = {
       idle: () => "Up to date",
       checking_ratings: (d) => `Checking ratings: ${d.processed ?? 0} / ${d.total ?? 0}`,
       waiting_for_limit_reset: (d) => `Waiting for OMDb daily limit reset (${d.pending ?? 0} pending) ...`,
+      stale_refresh_pending: () => "Every movie has a rating - refreshing stale ones in the background",
     },
     traktPhase: {
       unauthorized: () => "Not connected",
@@ -84,6 +88,9 @@ const STRINGS = {
     moviesCountSuffix: (n) => `${n} Filme`,
     lastFullSyncLabel: (date) => `Zuletzt vollst\u00e4ndig: ${date}`,
     pendingSuffix: (n) => `${n} ausstehend`,
+    ratingNeverChecked: "Noch nicht bei OMDb gepr\u00fcft",
+    ratingChecked: (date) => `OMDb-Bewertung gepr\u00fcft: ${date}`,
+    ratingCheckedStale: (date) => `OMDb-Bewertung gepr\u00fcft: ${date} (Aktualisierung ausstehend)`,
     footerLine1:
       "Datenquellen: TMDb (Katalog, Verf\u00fcgbarkeit, Genres, Filmseite), OMDb (Rotten-Tomatoes- & Metacritic-Wertung).",
     footerLine2: "TODO = noch nicht gepr\u00fcft \u00b7 N/A = gepr\u00fcft, keine Wertung vorhanden.",
@@ -104,6 +111,7 @@ const STRINGS = {
       idle: () => "Aktuell",
       checking_ratings: (d) => `Pr\u00fcfe Bewertungen: ${d.processed ?? 0} / ${d.total ?? 0}`,
       waiting_for_limit_reset: (d) => `Warte auf OMDb-Limit-Reset (${d.pending ?? 0} ausstehend) ...`,
+      stale_refresh_pending: () => "Alle Filme bewertet \u2013 aktualisiere veraltete Bewertungen im Hintergrund",
     },
     traktPhase: {
       unauthorized: () => "Nicht verbunden",
@@ -132,6 +140,20 @@ export function localizePhaseMessage(provider, statusData, lang) {
   const fn = table && table[statusData.phase];
   if (fn) return fn(statusData);
   return statusData.message || "";
+}
+
+/**
+ * Builds the tooltip text for an RT/Metacritic cell: when its rating was
+ * last checked against OMDb, or that it's never been checked, plus a note
+ * when a background refresh of an already-known rating is pending (not a
+ * coverage gap - see splitPendingOmdbIds/selectPendingOmdbIds in
+ * lib/omdb.js for why that's a distinct, lower-urgency state).
+ */
+export function formatRatingTooltip(checkedAtIso, needsRefresh, lang) {
+  const strings = getStrings(lang);
+  if (!checkedAtIso) return strings.ratingNeverChecked;
+  const date = formatLocalizedDate(checkedAtIso, lang);
+  return needsRefresh ? strings.ratingCheckedStale(date) : strings.ratingChecked(date);
 }
 
 /** Formats an ISO date string per the given UI language, or "never"/"nie" if absent. */
@@ -170,6 +192,8 @@ export function projectMovieForLocale(movie, lang) {
     year: movie.year,
     rt: movie.rt,
     metacritic: movie.metacritic,
+    ratingCheckedAt: movie.ratingCheckedAt,
+    ratingNeedsRefresh: movie.ratingNeedsRefresh,
     watched: movie.watched,
     tmdbUrl: buildTmdbMovieUrl(movie.id, lang),
   };

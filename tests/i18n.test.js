@@ -4,6 +4,7 @@ import {
   getStrings,
   localizePhaseMessage,
   formatLocalizedDate,
+  formatRatingTooltip,
   buildTmdbMovieUrl,
   projectMovieForLocale,
   getStoredLanguage,
@@ -54,6 +55,23 @@ test("formatLocalizedDate: formats a real date without throwing, for both langua
   assert.equal(typeof formatLocalizedDate(iso, "de"), "string");
 });
 
+test("formatRatingTooltip: never-checked (no checkedAt) uses the dedicated placeholder", () => {
+  assert.equal(formatRatingTooltip(null, false, "en"), "Not checked against OMDb yet");
+  assert.equal(formatRatingTooltip(undefined, false, "de"), "Noch nicht bei OMDb geprüft");
+});
+
+test("formatRatingTooltip: a fresh, up-to-date rating shows just the checked date", () => {
+  const iso = "2026-08-14T10:15:00.000Z";
+  assert.match(formatRatingTooltip(iso, false, "en"), /^OMDb rating checked: /);
+  assert.doesNotMatch(formatRatingTooltip(iso, false, "en"), /refresh pending/);
+});
+
+test("formatRatingTooltip: a stale, due-for-refresh rating notes that a refresh is pending", () => {
+  const iso = "2026-08-14T10:15:00.000Z";
+  assert.match(formatRatingTooltip(iso, true, "en"), /refresh pending/);
+  assert.match(formatRatingTooltip(iso, true, "de"), /Aktualisierung ausstehend/);
+});
+
 test("buildTmdbMovieUrl: uses the matching TMDb locale per UI language", () => {
   assert.equal(buildTmdbMovieUrl("603", "en"), "https://www.themoviedb.org/movie/603?language=en-US");
   assert.equal(buildTmdbMovieUrl("603", "de"), "https://www.themoviedb.org/movie/603?language=de-DE");
@@ -67,6 +85,8 @@ test("projectMovieForLocale: picks the requested language's title/genres", () =>
     year: "1999",
     rt: 83,
     metacritic: 73,
+    ratingCheckedAt: "2026-08-14T10:15:00.000Z",
+    ratingNeedsRefresh: true,
     watched: "watched",
   };
   const en = projectMovieForLocale(movie, "en");
@@ -77,6 +97,8 @@ test("projectMovieForLocale: picks the requested language's title/genres", () =>
   assert.equal(de.rt, 83);
   assert.equal(en.watched, "watched");
   assert.equal(de.watched, "watched");
+  assert.equal(en.ratingCheckedAt, "2026-08-14T10:15:00.000Z");
+  assert.equal(en.ratingNeedsRefresh, true);
 });
 
 test("projectMovieForLocale: falls back to English, then any available language, if requested language is missing", () => {

@@ -1,6 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseOmdbPayload, isOmdbLimitResponse, isOmdbAuthError, isRatingStale, selectPendingOmdbIds } from "../lib/omdb.js";
+import {
+  parseOmdbPayload,
+  isOmdbLimitResponse,
+  isOmdbAuthError,
+  isRatingStale,
+  selectPendingOmdbIds,
+  splitPendingOmdbIds,
+} from "../lib/omdb.js";
 
 test("parseOmdbPayload: reads RT and Metacritic from a normal response", () => {
   const data = {
@@ -110,4 +117,17 @@ test("selectPendingOmdbIds: a fresh, already up-to-date rating is excluded", () 
 test("selectPendingOmdbIds: tolerates a missing/empty entries map", () => {
   assert.deepEqual(selectPendingOmdbIds(null), []);
   assert.deepEqual(selectPendingOmdbIds({}), []);
+});
+
+test("splitPendingOmdbIds: separates genuine coverage gaps from optional stale refreshes", () => {
+  const entries = {
+    "1": { rt: 91, metacritic: 74, needsRefresh: true },
+    "2": { rt: "TODO", metacritic: "TODO" },
+    "3": { rt: "TODO", metacritic: "TODO" },
+    "4": { rt: null, metacritic: null, needsRefresh: true },
+    "5": { rt: 50, metacritic: 60 }, // fresh, up to date - excluded from both
+  };
+  const { neverChecked, dueForRefresh } = splitPendingOmdbIds(entries);
+  assert.deepEqual(neverChecked, ["2", "3"]);
+  assert.deepEqual(dueForRefresh, ["1", "4"]);
 });
