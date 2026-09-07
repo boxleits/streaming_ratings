@@ -10,11 +10,12 @@ regardless of whether a browser is currently connected:
 
 - The **TMDb catalog** (title, year, genres, link) is fully reloaded on
   its own configurable interval (default: daily).
-- **OMDb ratings** (RT + Metacritic) are checked per movie independently
-  of that, and automatically rechecked after their own, longer interval
-  (default: 7 days).
-- If the OMDb daily limit is hit, the engine automatically pauses and
-  retries at configurable intervals — no manual intervention needed.
+- Each **rating source** (OMDb, and the optional Rotten Tomatoes scraper)
+  checks movies on its **own** interval, entirely independently of the
+  catalog and of each other.
+- If one source has to wait — OMDb's daily limit is hit, Rotten Tomatoes is
+  unreachable — it backs off on its own and the others carry on unaffected.
+  No manual intervention needed.
 - All connected browsers are kept live-updated via Server-Sent Events.
 - The **UI language (English/German) is user-selectable**, right in the
   browser, and includes movie titles and genre names — not just interface
@@ -41,9 +42,11 @@ choice with the trade-offs spelled out in its own section.
 |--------------------------------|----------|--------------------------|--------------|
 | `TMDB_API_KEY`                 | yes      | –                         | TMDb v3 API key |
 | `OMDB_API_KEY`                 | yes*     | –                         | OMDb API key. Without it (and without `RT_SCRAPE_ENABLED`), the catalog still works, but RT/Metacritic stay permanently "TODO". |
+| `OMDB_RETRY_INTERVAL_MINUTES`  | no       | `30`                      | How long OMDb pauses itself after hitting its daily limit. Only OMDb waits — every other source keeps running. |
 | `RT_SCRAPE_ENABLED`            | no       | `false`                   | `true`/`1` enables the optional Rotten Tomatoes scraper as the primary RT source — see "Rotten Tomatoes without OMDb" below. Works with or without an OMDb key. |
 | `RT_REQUEST_DELAY_MS`          | no       | `1500`                    | Wait time between individual rottentomatoes.com page requests. Deliberately slow — don't lower it without reason. |
 | `RT_REFRESH_INTERVAL_HOURS`    | no       | `24`                      | How old a tomatometer may get before it's re-scraped. Independent of `OMDB_REFRESH_INTERVAL_HOURS` — scraping has no quota, so RT can refresh far more often than Metacritic. |
+| `RT_RETRY_INTERVAL_MINUTES`    | no       | `30`                      | How long RT backs off after Rotten Tomatoes or Wikidata is unreachable. Separate from `OMDB_RETRY_INTERVAL_MINUTES`: the two sources fail for unrelated reasons. |
 | `RT_USER_AGENT`                | no       | a descriptive default     | User-Agent sent to Wikidata/RT. Wikidata rejects generic clients, so keep it descriptive. |
 | `TRAKT_CLIENT_ID`              | no       | –                         | Trakt API app Client ID. Leave both Trakt vars unset to disable the feature entirely (the "Watched" column and Trakt status row are hidden). |
 | `TRAKT_CLIENT_SECRET`          | no       | –                         | Trakt API app Client Secret. Needed together with `TRAKT_CLIENT_ID` for the device-code OAuth flow. |
@@ -51,7 +54,6 @@ choice with the trade-offs spelled out in its own section.
 | `PORT`                         | no       | `3000`                    | Server port |
 | `TMDB_REFRESH_INTERVAL_HOURS`  | no       | `24`                      | How often the entire catalog is reloaded from TMDb |
 | `OMDB_REFRESH_INTERVAL_HOURS`  | no       | `168` (7 days)            | How old an RT/Metacritic rating may get before it's automatically rechecked |
-| `OMDB_RETRY_INTERVAL_MINUTES`  | no       | `30`                      | Wait time between retries once the OMDb daily limit is hit |
 | `OMDB_REQUEST_DELAY_MS`        | no       | `150`                     | Wait time between individual OMDb requests (rate-limit protection) |
 | `ENGINE_IDLE_MS`               | no       | `15000`                   | How long the engine waits when there's currently nothing to do |
 | `PROVIDER_NAME`                | no       | `Amazon Prime Video`      | TMDb provider name, exactly as it appears in TMDb's provider list |
@@ -85,8 +87,9 @@ Tomatoes movie page instead:
   why this ships disabled by default.
 - A transient failure (RT throttling you, Wikidata unreachable) is
   explicitly **not** recorded as "checked, no rating" — the movie stays
-  pending and the engine backs off for `OMDB_RETRY_INTERVAL_MINUTES`,
-  so an outage can't silently turn hundreds of movies into false "N/A"s.
+  pending and RT backs off for `RT_RETRY_INTERVAL_MINUTES` (OMDb keeps
+  running meanwhile), so an outage can't silently turn hundreds of movies
+  into false "N/A"s.
 
 **Combining with OMDb:** the two are independent.
 
@@ -101,21 +104,15 @@ Tomatoes movie page instead:
 `OMDB_REFRESH_INTERVAL_HOURS`: it has `RT_REFRESH_INTERVAL_HOURS` (24h by
 default, versus a week for OMDb), because scraping costs no quota and there's
 no reason to make a fresh tomatometer wait for Metacritic. The status panel
-gains an **RT** row with its own "Sync now" button (`POST /api/rt/refresh`)
-that, unlike OMDb's, does **not** blank the table back to "TODO" and does
-**not** touch OMDb — so re-scraping the whole catalog can't burn a single
-request of the daily quota. An entry queued purely by RT's clock likewise
-skips its OMDb call entirely, and leaves OMDb's own staleness timestamp
-alone, so Metacritic still goes stale on schedule.
+has an **RT** row with its own "Sync now" button (`POST /api/rt/refresh`)
+that queues a re-scrape of `rt-cache.json` alone — re-scraping the whole
+catalog can't burn a single request of the OMDb quota, and OMDb's own
+staleness clock is untouched, so Metacritic still refreshes on schedule.
 
-**When OMDb hits its daily limit with the scraper enabled**, the pass does
-*not* stop: OMDb is dropped for the rest of that pass and RT — which has no
-quota — keeps filling the column on its own. Movies processed that way get
-their RT score right away and are marked as still owing a Metacritic score
-(`metacriticPending` in `omdb-cache.json`), which a later pass fills in once
-the quota is back. Those entries are the lowest-priority tier in the queue,
-and their RT score is **not** re-scraped (it's already fresh) nor overwritten
-by OMDb's own RT value when the catch-up pass runs.
+**When OMDb hits its daily limit**, it pauses *itself* for
+`OMDB_RETRY_INTERVAL_MINUTES` and the RT scraper keeps going at full speed —
+the two run as separate passes over separate caches, so neither one waiting
+holds up the other (nor the Trakt sync).
 
 ## Trakt: "Watched" status (optional)
 
@@ -179,22 +176,32 @@ would discard all prior progress (catalog + already-checked movies).
   fetched **once per supported UI language** (see "Language switching"
   below) and stored per movie as e.g. `title: { en: "...", de: "..." }`.
   **Fully replaced** on every `TMDB_REFRESH_INTERVAL_HOURS` cycle.
-- **`omdb-cache.json`** – RT/Metacritic rating per movie. Language-
-  independent (just numbers), updated per movie individually, independent
-  of the catalog refresh.
+- **`imdb-ids.json`** – TMDb movie ID → IMDb ID. Primary-source data
+  (TMDb's `external_ids`), so it lives with the catalog rather than inside
+  any one rating source: OMDb, the RT scraper and Trakt all read it, none
+  of them owns it. Misses are remembered too.
+- **`omdb-cache.json`** – OMDb's own ratings per movie (Metacritic, plus
+  OMDb's RT figure). Language-independent (just numbers), updated per movie
+  individually, on `OMDB_REFRESH_INTERVAL_HOURS`.
+- **`rt-cache.json`** *(only if `RT_SCRAPE_ENABLED`)* – the scraped
+  tomatometer per movie, on its own `RT_REFRESH_INTERVAL_HOURS`. A peer of
+  `omdb-cache.json`, not a part of it.
+- **`rt-slug-cache.json`** *(only if `RT_SCRAPE_ENABLED`)* – IMDb ID → Rotten
+  Tomatoes slug, resolved via Wikidata. Never expires (the mapping is a
+  stable fact about a film) and remembers misses too. Delete it to force a
+  full re-resolve.
 - **`trakt-auth.json`** *(only if Trakt is configured)* – OAuth tokens for
   the single, server-wide Trakt connection. Sensitive — see "Trakt:
   Watched status" below.
 - **`trakt-watched.json`** *(only if Trakt is configured)* – the derived
   list of watched IMDb IDs, refreshed on `TRAKT_REFRESH_INTERVAL_HOURS`.
-- **`rt-slug-cache.json`** *(only if `RT_SCRAPE_ENABLED`)* – IMDb ID → Rotten
-  Tomatoes slug, resolved via Wikidata. Never expires (the mapping is a
-  stable fact about a film) and remembers misses too. Delete it to force a
-  full re-resolve.
 
-This decouples the data sources: a catalog refresh doesn't automatically
-trigger a recheck of all movies' OMDb ratings or a Trakt re-sync, and
-vice versa.
+**One file per source is the point, not an accident.** Each rating source
+owns exactly one cache, and nothing else writes to it. You can delete
+`rt-cache.json` to force a full re-scrape without spending a single OMDb
+request, or delete `omdb-cache.json` without losing a single scraped
+tomatometer. A catalog refresh likewise doesn't trigger a recheck of any
+source, and no source's failure invalidates another's data.
 
 ## Atomic catalog switch
 
@@ -301,9 +308,13 @@ Top right shows a panel per provider (TMDb / OMDb, plus **RT** when
 `RT_SCRAPE_ENABLED` and **Trakt** when Trakt is configured):
 
 - current phase (up to date / running / waiting for limit reset / error),
-- timestamp of the last full sync,
-- while an OMDb check is running or waiting for a limit reset: number of
-  movies still pending.
+- timestamp of that source's last full sync,
+- number of movies still pending for that source while it's working.
+
+**Each row reports only its own source.** An RT sweep counts up in the RT
+row and nowhere else; OMDb's quota wait shows only in the OMDb row. (Before
+the sources were split apart, both ran through one pass, so RT's progress
+appeared under OMDb.)
 
 The OMDb status turns **red** ("waiting for OMDb daily limit reset") only
 when movies that have **never** been checked at all are still stuck behind
@@ -314,9 +325,11 @@ in-progress state instead ("every movie has a rating - refreshing stale
 ones in the background") - not a problem, just a nice-to-have still
 catching up.
 
-Each "Sync now" button is grayed out while a sync is already running for
-that provider — an ongoing wait for a limit reset also counts as
-"currently running".
+Each source has its own "Sync now", which queues a re-check of **that
+source only** — OMDb's costs no scraping, RT's costs no OMDb quota. Neither
+blanks the table back to "TODO": the values on screen stay until fresh ones
+replace them. A button is grayed out while that source is already working;
+an explicit "Sync now" also cancels that source's current back-off.
 
 ## Debug mode
 
@@ -365,6 +378,10 @@ keys required), against extracted, pure logic:
 
 - **`tests/omdb.test.js`** – OMDb response parsing (RT/Metacritic
   extraction) and daily-limit detection (`lib/omdb.js`).
+- **`tests/ratings.test.js`** – the logic every secondary source shares
+  (`lib/ratings.js`): staleness, the never-checked/stale work tiers, and the
+  merge precedence between sources (including that enabling the scraper can
+  never blank a value OMDb already had).
 - **`tests/rottentomatoes.test.js`** – RT page parsing across every
   supported markup variant plus the fail-soft paths (`lib/rottentomatoes.js`),
   and the batched IMDb→RT-slug SPARQL query building/parsing
@@ -531,6 +548,8 @@ reach the host's Podman socket from within it.
 ```
 server.js                    Express app + background engine (entry point)
 lib/
+  ratings.js                 Source-agnostic rating logic shared by every secondary source:
+                             staleness, work scheduling, the merge into one view (tested, no network)
   omdb.js                    Pure OMDb response parsing / limit detection (tested, no network)
   trakt.js                   Pure Trakt response parsing / OAuth-flow status helpers (tested, no network)
   rottentomatoes.js          Pure RT page parsing (multi-strategy, fail-soft) + failure classification (tested, no network)
@@ -552,23 +571,53 @@ playwright.config.js          E2E test config (auto-starts the server)
 
 ### Architecture at a glance
 
+- **One primary source, several independent secondary ones.**
+
+  ```
+  TMDb (primary)          which movies exist, their titles/years/genres,
+    |                     and their IMDb IDs — everything else keys off this
+    +-- OMDb   (secondary)  Metacritic, plus an RT figure as a fallback
+    +-- RT     (secondary)  the tomatometer, scraped
+    +-- Trakt  (secondary)  watched status
+  ```
+
+  The secondaries are **peers, not layers**. Each owns one cache file, one
+  refresh interval, one status row, one manual trigger and one pass in the
+  engine loop, and each runs in its own `try`/`catch`. None of them calls,
+  waits on, or writes to another's state. Adding a further rating source
+  means adding one more block to the loop — not threading it through an
+  existing one. `lib/ratings.js` holds the parts that are genuinely the
+  same for all of them (staleness, work scheduling, the merge into one
+  view); everything else is deliberately duplicated per source so the
+  sources stay independent.
+- **A waiting source never blocks the loop.** When a source has to back off
+  (OMDb's daily quota is spent, Rotten Tomatoes is refusing us), it records
+  *when* it may try again and returns — it does not sleep inside its pass.
+  Sleeping there would hold up every other source, which is precisely how a
+  rate-limited OMDb key used to stall the RT scraper and the Trakt sync
+  along with it.
+- **The sources are merged only at the view layer**, in
+  `mergeRatingView`. The RT scraper wins the RT column once it has actually
+  checked, since it reads the score off Rotten Tomatoes itself while OMDb's
+  RT figure is a second-hand copy that's missing for many titles — but a
+  movie the scraper hasn't reached still falls back to OMDb's value, so
+  enabling the scraper never removes data.
 - **No request-driven scanning.** A single background loop
   (`backgroundEngineLoop` in `server.js`) runs continuously from process
-  start, independent of HTTP requests. It alternates between refreshing
-  the TMDb catalog (on its own interval) and processing pending OMDb
-  rating checks.
-- **Two independent caches**, each with its own refresh cadence and its
-  own JSON file on disk (see "Two separate caches" above) — deliberately
-  not merged into one cache, so a catalog refresh and a ratings refresh
-  never force each other.
+  start, independent of HTTP requests.
+- **The primary source owns the ID set.** `reconcileSecondaryCaches` gives
+  every catalog movie an entry in every secondary cache and drops entries
+  for movies that left the catalog. It runs at startup as well as after a
+  catalog refresh, so a cache predating a source (or a source enabled
+  later) is filled in without waiting for the next refresh cycle.
 - **Atomic catalog swap.** The new TMDb catalog is built in a local
   variable first; only after it's complete does the code swap it into the
   shared state and broadcast a single `snapshot` SSE event. No client ever
   observes a half-updated catalog.
 - **SSE, not polling.** `/api/stream` pushes `init` (full state on
   connect), `upsert` (single movie changed), `snapshot` (full catalog
-  swap), `ratings_reset`, `status`, and `ping` (liveness heartbeat, not a
-  real update) events to every connected client.
+  swap), `status`, and `ping` (liveness heartbeat, not a real update)
+  events to every connected client.
 - **Pure logic is extracted on purpose.** Anything that doesn't need the
   DOM, the network, or Express (rating parsing, filtering/sorting,
   connection/watchdog behavior, translations) lives in its own small
@@ -651,6 +700,15 @@ restart `node server.js` (or use a file watcher of your choice, e.g.
   significantly.
 
 ## Migrating from an older version
+
+**Splitting the rating sources apart (latest change).** The single
+`omdb-cache.json` entry used to carry the IMDb ID, *both* sources' ratings
+and both sources' timestamps. It's now split into `imdb-ids.json` (primary
+data), `omdb-cache.json` (OMDb's own ratings) and `rt-cache.json` (scraped
+tomatometers). **This migration is automatic and runs once at startup** —
+scraped RT scores, IMDb IDs and any pending Metacritic re-checks are moved
+to their new homes, and the log line says what moved. No manual action, and
+nothing is re-fetched that had already been fetched.
 
 The cache file format has changed (separate `tmdb-cache.json` /
 `omdb-cache.json` instead of a single `cache.json`). An old `cache.json`

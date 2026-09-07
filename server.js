@@ -2,16 +2,8 @@ import express from "express";
 import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
-import {
-  OmdbLimitError,
-  OmdbAuthError,
-  isOmdbLimitResponse,
-  isOmdbAuthError,
-  parseOmdbPayload,
-  isRatingStale,
-  selectPendingOmdbIds,
-  splitPendingOmdbIds,
-} from "./lib/omdb.js";
+import { OmdbLimitError, OmdbAuthError, isOmdbLimitResponse, isOmdbAuthError, parseOmdbPayload } from "./lib/omdb.js";
+import { splitPendingIds, markStale, mergeRatingView } from "./lib/ratings.js";
 import { buildRtUrl, parseRtPage, isRtTransientFailure } from "./lib/rottentomatoes.js";
 import { buildRtIdQuery, parseRtIdBindings } from "./lib/wikidata.js";
 import {
@@ -53,6 +45,10 @@ const RT_REQUEST_DELAY_MS = parseInt(process.env.RT_REQUEST_DELAY_MS || "1500", 
 // tomatometer wait out OMDB_REFRESH_INTERVAL_HOURS (a week by default) just
 // because Metacritic has to.
 const RT_REFRESH_INTERVAL_HOURS = parseFloat(process.env.RT_REFRESH_INTERVAL_HOURS || "24");
+// RT's own back-off, separate from OMDB_RETRY_INTERVAL_MINUTES: the two
+// sources fail for unrelated reasons (a daily quota vs. a website being
+// unreachable) and shouldn't share a knob.
+const RT_RETRY_INTERVAL_MINUTES = parseFloat(process.env.RT_RETRY_INTERVAL_MINUTES || "30");
 // Sent on every rottentomatoes.com/wikidata.org request. Wikidata requires a
 // descriptive one (it 403s generic clients); RT gets the same courtesy so
 // the traffic is at least honestly attributable.
@@ -84,6 +80,7 @@ const WIKIDATA_SPARQL_BASE = "https://query.wikidata.org/sparql";
 // for an entire catalog.
 const WIKIDATA_BATCH_SIZE = 200;
 const RT_REFRESH_INTERVAL_MS = RT_REFRESH_INTERVAL_HOURS * 3600 * 1000;
+const RT_RETRY_INTERVAL_MS = RT_RETRY_INTERVAL_MINUTES * 60 * 1000;
 const TMDB_REFRESH_INTERVAL_MS = TMDB_REFRESH_INTERVAL_HOURS * 3600 * 1000;
 const OMDB_REFRESH_INTERVAL_MS = OMDB_REFRESH_INTERVAL_HOURS * 3600 * 1000;
 const OMDB_RETRY_INTERVAL_MS = OMDB_RETRY_INTERVAL_MINUTES * 60 * 1000;
@@ -104,6 +101,12 @@ const TRAKT_WATCHED_FILE = path.join(CACHE_DIR, "trakt-watched.json");
 // is a remembered "Wikidata has no RT id for this one", so we don't ask
 // again on every pass.
 const RT_SLUG_CACHE_FILE = path.join(CACHE_DIR, "rt-slug-cache.json");
+// One file per source, so each can be inspected, reasoned about or deleted
+// on its own - deleting rt-cache.json re-scrapes RT without touching a
+// single OMDb request, and vice versa.
+const RT_CACHE_FILE = path.join(CACHE_DIR, "rt-cache.json");
+// Primary-source data (TMDb external_ids), shared by both secondaries and Trakt.
+const IMDB_ID_CACHE_FILE = path.join(CACHE_DIR, "imdb-ids.json");
 
 function debugLog(...args) {
   if (!DEBUG_MODE) return;
@@ -140,16 +143,32 @@ function wakeEngine() {
 }
 
 // ---------------------------------------------------------------------------
-// Two separate, provider-specific caches:
-//  - tmdbCatalog: title/year/genres/link, fully reloaded on an interval of
-//    TMDB_REFRESH_INTERVAL_HOURS. The switch happens ATOMICALLY (see below).
-//  - omdbRatings: RT and Metacritic rating per movie, "TODO" until first
-//    checked. After OMDB_REFRESH_INTERVAL_HOURS a checked entry is flagged
-//    `needsRefresh` (keeping its last known rating visible) rather than
-//    reset back to "TODO" - see markStaleRatings/selectPendingOmdbIds.
+// ONE primary source, several independent secondary ones.
+//
+//   TMDb (primary)   which movies exist, their titles/years/genres, and
+//                    their IMDb ids. Everything else keys off this.
+//     |
+//     +-- OMDb (secondary)  Metacritic, plus an RT figure as a fallback
+//     +-- RT   (secondary)  the tomatometer, scraped
+//
+// The secondaries are PEERS, not layers: each owns its own cache file, its
+// own refresh interval, its own status row and its own manual trigger, and
+// each is processed by its own pass in the engine loop. Neither can stall,
+// block or invalidate the other - an exhausted OMDb quota does not hold up
+// RT, and an unreachable RT does not hold up OMDb. lib/ratings.js holds the
+// parts that are the same for both (scheduling, staleness, the merge into
+// one view); everything below is deliberately duplicated per source rather
+// than shared, so the two stay independent.
+//
+// The catalog switch happens ATOMICALLY (see refreshTmdbCatalog).
 // ---------------------------------------------------------------------------
 let tmdbCatalog = { movies: {}, lastRefresh: 0 };
+// tmdbId -> "tt..." | null. A primary-source fact (TMDb's external_ids), so
+// it lives with the catalog rather than inside either secondary's cache -
+// OMDb, RT and Trakt all read it, none of them owns it.
+let imdbIds = {};
 let omdbRatings = { entries: {}, lastFullSync: null };
+let rtScores = { entries: {}, lastFullSync: null };
 let forceTmdbRefresh = false;
 
 function loadTmdbCache() {
@@ -192,6 +211,108 @@ function saveOmdbCache() {
   }
 }
 
+function loadImdbIdCache() {
+  try {
+    if (fs.existsSync(IMDB_ID_CACHE_FILE)) {
+      imdbIds = JSON.parse(fs.readFileSync(IMDB_ID_CACHE_FILE, "utf-8"));
+      debugLog(`IMDb id cache loaded: ${Object.keys(imdbIds).length} entries`);
+    }
+  } catch (err) {
+    console.error("Could not load IMDb id cache, starting empty:", err.message);
+    imdbIds = {};
+  }
+}
+function saveImdbIdCache() {
+  try {
+    fs.mkdirSync(CACHE_DIR, { recursive: true });
+    fs.writeFileSync(IMDB_ID_CACHE_FILE, JSON.stringify(imdbIds));
+  } catch (err) {
+    console.error("Could not save IMDb id cache:", err.message);
+  }
+}
+
+function loadRtCache() {
+  try {
+    if (fs.existsSync(RT_CACHE_FILE)) {
+      rtScores = JSON.parse(fs.readFileSync(RT_CACHE_FILE, "utf-8"));
+      debugLog(`RT cache loaded: ${Object.keys(rtScores.entries).length} entries`);
+    }
+  } catch (err) {
+    console.error("Could not load RT cache, starting empty:", err.message);
+    rtScores = { entries: {}, lastFullSync: null };
+  }
+}
+function saveRtCache() {
+  try {
+    fs.mkdirSync(CACHE_DIR, { recursive: true });
+    fs.writeFileSync(RT_CACHE_FILE, JSON.stringify(rtScores));
+  } catch (err) {
+    console.error("Could not save RT cache:", err.message);
+  }
+}
+
+/**
+ * One-time migration from the pre-split cache, where a single omdb-cache.json
+ * entry carried the IMDb id, both sources' ratings and both sources'
+ * timestamps. Splits that apart into the three caches that own those facts
+ * now. Runs only for fields that are actually present, so it is a no-op on
+ * an already-migrated cache and safe to leave in place.
+ */
+function migrateLegacyOmdbCache() {
+  let movedIds = 0;
+  let movedRt = 0;
+  let owedMetacritic = 0;
+
+  for (const [id, entry] of Object.entries(omdbRatings.entries)) {
+    if (!entry) continue;
+
+    if (entry.imdbId !== undefined) {
+      if (!(id in imdbIds)) imdbIds[id] = entry.imdbId;
+      delete entry.imdbId;
+      movedIds++;
+    }
+
+    // rtCheckedAt only ever existed if the scraper had run, so it marks the
+    // stored `rt` as the scraper's value rather than OMDb's.
+    if (entry.rtCheckedAt !== undefined) {
+      if (!rtScores.entries[id]) {
+        rtScores.entries[id] = {
+          tomatometer: typeof entry.rt === "number" ? entry.rt : null,
+          checkedAt: entry.rtCheckedAt,
+          needsRefresh: Boolean(entry.rtNeedsRefresh),
+        };
+        movedRt++;
+      }
+      delete entry.rtCheckedAt;
+      delete entry.rtNeedsRefresh;
+    } else if (entry.rtNeedsRefresh !== undefined) {
+      delete entry.rtNeedsRefresh;
+    }
+
+    // "OMDb still owes a Metacritic score" is just an ordinary refresh now
+    // that the sources no longer wait on each other.
+    if (entry.metacriticPending) {
+      entry.needsRefresh = true;
+      owedMetacritic++;
+    }
+    delete entry.metacriticPending;
+
+    // The old format used rt/metacritic === "TODO" plus checkedAt: null for
+    // "never checked"; the new one keys off checkedAt alone.
+    if (entry.rt === "TODO") entry.rt = null;
+    if (entry.metacritic === "TODO") entry.metacritic = null;
+  }
+
+  if (movedIds || movedRt || owedMetacritic) {
+    console.log(
+      `Migrated legacy cache: ${movedIds} IMDb id(s), ${movedRt} scraped RT score(s), ${owedMetacritic} pending Metacritic re-check(s).`
+    );
+    saveOmdbCache();
+    saveImdbIdCache();
+    saveRtCache();
+  }
+}
+
 // imdbId -> "m/<slug>" | null (null = Wikidata knows no RT id for it).
 let rtSlugs = {};
 
@@ -215,8 +336,38 @@ function saveRtSlugCache() {
   }
 }
 
+/**
+ * The primary source owns the id set: every catalog movie gets an entry in
+ * every secondary cache, and entries for movies that left the catalog are
+ * dropped. Run at startup as well as after a catalog refresh, so a cache
+ * that predates a source (or a source enabled later) is reconciled without
+ * waiting for the next TMDB_REFRESH_INTERVAL_HOURS.
+ */
+function reconcileSecondaryCaches() {
+  let added = 0;
+  for (const id of Object.keys(tmdbCatalog.movies)) {
+    if (!omdbRatings.entries[id]) {
+      omdbRatings.entries[id] = { rt: null, metacritic: null, checkedAt: null };
+      added++;
+    }
+    if (!rtScores.entries[id]) {
+      rtScores.entries[id] = { tomatometer: null, checkedAt: null };
+      added++;
+    }
+  }
+  if (added > 0) {
+    debugLog(`Reconciled secondary caches with the catalog: ${added} entr(ies) added`);
+    saveOmdbCache();
+    saveRtCache();
+  }
+}
+
 loadTmdbCache();
+loadImdbIdCache();
 loadOmdbCache();
+loadRtCache();
+migrateLegacyOmdbCache();
+reconcileSecondaryCaches();
 if (RT_SCRAPE_ENABLED) loadRtSlugCache();
 
 // ---------------------------------------------------------------------------
@@ -286,10 +437,13 @@ if (TRAKT_CONFIGURED) {
 function buildMovieView(id) {
   const cat = tmdbCatalog.movies[id];
   if (!cat) return null;
-  const rating = omdbRatings.entries[id] || { rt: "TODO", metacritic: "TODO" };
+  // Each source is read independently and merged only here, at the view
+  // layer - see mergeRatingView for the precedence rule.
+  const merged = mergeRatingView(omdbRatings.entries[id], rtScores.entries[id]);
+  const imdbId = imdbIds[id];
   let watched = "N/A"; // Trakt not connected, or this movie's IMDb id isn't known yet
-  if (TRAKT_CONFIGURED && traktAuth && rating.imdbId) {
-    watched = traktWatchedSet.has(rating.imdbId) ? "watched" : "unseen";
+  if (TRAKT_CONFIGURED && traktAuth && imdbId) {
+    watched = traktWatchedSet.has(imdbId) ? "watched" : "unseen";
   }
   return {
     id,
@@ -297,10 +451,11 @@ function buildMovieView(id) {
     year: cat.year,
     genres: cat.genres,
     tmdbUrl: cat.tmdbUrl,
-    rt: rating.rt,
-    metacritic: rating.metacritic,
-    ratingCheckedAt: rating.checkedAt || null,
-    ratingNeedsRefresh: Boolean(rating.needsRefresh),
+    rt: merged.rt,
+    metacritic: merged.metacritic,
+    rtCheckedAt: merged.rtCheckedAt,
+    omdbCheckedAt: merged.omdbCheckedAt,
+    ratingNeedsRefresh: merged.ratingNeedsRefresh,
     watched,
   };
 }
@@ -348,20 +503,20 @@ let engineStatus = {
   },
 };
 
-// Tracked separately from the OMDb cache's lastFullSync: RT refreshes on its
-// own, much shorter interval, so "when did RT last complete a sweep" is a
-// different fact from "when did OMDb".
-let rtLastSync = null;
-
+// Each source reports only its own progress. RT's sweep no longer shows up
+// in the OMDb row (and vice versa) - that was the visible symptom of the two
+// sharing one processing pass.
 function setRtStatus(phase, message, extra = {}) {
-  if (extra.lastSync) rtLastSync = extra.lastSync;
+  if (extra.lastSync) rtScores.lastFullSync = extra.lastSync;
   engineStatus.rt = {
     configured: RT_SCRAPE_ENABLED,
     phase,
     message,
     updatedAt: new Date().toISOString(),
-    lastSync: rtLastSync,
+    lastSync: rtScores.lastFullSync,
     pending: extra.pending ?? engineStatus.rt.pending ?? 0,
+    processed: extra.processed,
+    total: extra.total,
   };
   broadcast("status", { engineStatus });
 }
@@ -412,6 +567,9 @@ function setTraktStatus(phase, message, extra = {}) {
 // completed its first pass.
 setTmdbStatus("idle", tmdbCatalog.lastRefresh ? "Catalog loaded from cache." : "No catalog loaded yet.");
 setOmdbStatus("idle", omdbRatings.lastFullSync ? "Ratings loaded from cache." : "No ratings checked yet.");
+if (RT_SCRAPE_ENABLED) {
+  setRtStatus("idle", rtScores.lastFullSync ? "Tomatometers loaded from cache." : "No tomatometers fetched yet.");
+}
 if (TRAKT_CONFIGURED) {
   setTraktStatus(
     traktAuth ? "idle" : "unauthorized",
@@ -443,24 +601,21 @@ app.post("/api/tmdb/refresh", (req, res) => {
   res.json({ ok: true, queued: true });
 });
 
+// One manual trigger per secondary source, each touching only its own
+// cache. Neither blanks the table back to "TODO": the stored values stay
+// visible until fresh ones replace them (see markStale).
 app.post("/api/omdb/refresh", (req, res) => {
-  if (!OMDB_API_KEY && !RT_SCRAPE_ENABLED) {
-    return res.status(400).json({ error: "Neither OMDB_API_KEY nor RT_SCRAPE_ENABLED is set." });
+  if (!OMDB_API_KEY) {
+    return res.status(400).json({ error: "OMDB_API_KEY is not set." });
   }
   if (engineStatus.omdb.phase === "checking_ratings" || engineStatus.omdb.phase === "waiting_for_limit_reset") {
     return res.json({ ok: true, alreadyRunning: true });
   }
   const ids = Object.keys(omdbRatings.entries);
-  for (const id of ids) {
-    omdbRatings.entries[id].rt = "TODO";
-    omdbRatings.entries[id].metacritic = "TODO";
-    omdbRatings.entries[id].checkedAt = null;
-  }
+  for (const id of ids) omdbRatings.entries[id].needsRefresh = true;
+  omdbPausedUntil = 0; // an explicit "Sync now" outranks an ongoing back-off
   saveOmdbCache();
-  broadcast("ratings_reset", { ids });
-  setOmdbStatus("idle", `Manual sync triggered (${ids.length} movies will be rechecked).`, {
-    pending: ids.length,
-  });
+  setOmdbStatus("idle", `Manual OMDb sync triggered (${ids.length} movies queued).`, { pending: ids.length });
   wakeEngine();
   res.json({ ok: true, queued: true, count: ids.length });
 });
@@ -472,12 +627,10 @@ app.post("/api/rt/refresh", (req, res) => {
   if (engineStatus.rt.phase === "scraping") {
     return res.json({ ok: true, alreadyRunning: true });
   }
-  // Deliberately NOT the same as /api/omdb/refresh: nothing is blanked back
-  // to "TODO" (so the table keeps showing current values while the sweep
-  // runs) and OMDb isn't touched at all, so this can't burn the daily quota.
-  const ids = Object.keys(omdbRatings.entries);
-  for (const id of ids) omdbRatings.entries[id].rtNeedsRefresh = true;
-  saveOmdbCache();
+  const ids = Object.keys(rtScores.entries);
+  for (const id of ids) rtScores.entries[id].needsRefresh = true;
+  rtPausedUntil = 0; // an explicit "Sync now" outranks an ongoing back-off
+  saveRtCache();
   setRtStatus("idle", `Manual Rotten Tomatoes sync triggered (${ids.length} movies queued).`, { pending: ids.length });
   wakeEngine();
   res.json({ ok: true, queued: true, count: ids.length });
@@ -1037,17 +1190,22 @@ async function refreshTmdbCatalog() {
   // --- Atomic switch ---
   tmdbCatalog = { movies: newMovies, lastRefresh: Date.now() };
 
-  for (const id of newIds) {
-    if (!omdbRatings.entries[id]) {
-      omdbRatings.entries[id] = { imdbId: null, rt: "TODO", metacritic: "TODO", checkedAt: null };
-    }
-  }
+  // The primary source decides which movies exist; every secondary just
+  // gets an empty entry per movie to fill in on its own schedule, and loses
+  // entries for movies that left the catalog. Neither secondary is
+  // consulted here, and neither can hold this up.
+  reconcileSecondaryCaches();
   for (const id of previousIds) {
-    if (!newIds.has(id)) delete omdbRatings.entries[id];
+    if (newIds.has(id)) continue;
+    delete omdbRatings.entries[id];
+    delete rtScores.entries[id];
+    delete imdbIds[id];
   }
 
   saveTmdbCache();
+  saveImdbIdCache();
   saveOmdbCache();
+  saveRtCache();
 
   debugLog(`[TMDb] Catalog refresh done: ${newIds.size} movies (${Date.now() - t0}ms)`);
   setTmdbStatus("idle", `Catalog up to date: ${newIds.size} movies on ${PROVIDER_NAME} (DE).`);
@@ -1057,23 +1215,43 @@ async function refreshTmdbCatalog() {
 }
 
 /**
- * Flags ratings older than OMDB_REFRESH_INTERVAL_HOURS as due for a
- * re-check, via `needsRefresh` - deliberately does NOT reset rt/metacritic
- * back to "TODO" (unlike a never-checked movie), so the table keeps showing
- * the last known rating instead of regressing to a blank "TODO" for
- * however long it takes the engine to get back around to it. This also lets
- * selectPendingOmdbIds tell a genuine first-time gap apart from a stale
- * refresh and prioritize the former when the daily OMDb quota is tight.
+ * Resolves (and caches) a movie's IMDb id. This is PRIMARY-source data -
+ * TMDb's external_ids - so it lives here rather than inside either
+ * secondary's cache: OMDb needs it to query, RT needs it to find a slug,
+ * and Trakt needs it to match watched history. A `null` result is cached
+ * too, so a movie TMDb has no IMDb id for isn't looked up again and again.
  */
-function markStaleRatings() {
-  const now = Date.now();
-  let changed = 0;
-  for (const entry of Object.values(omdbRatings.entries)) {
-    if (!entry.needsRefresh && isRatingStale(entry.checkedAt, now, OMDB_REFRESH_INTERVAL_MS)) {
-      entry.needsRefresh = true;
-      changed++;
-    }
-  }
+// A source that needs to wait (a spent daily quota, a website refusing us)
+// records WHEN it may try again and returns - it never sleeps inside its
+// pass. Sleeping there would hold the whole engine loop, which is exactly
+// how a rate-limited OMDb used to stall RT and Trakt along with itself.
+let omdbPausedUntil = 0;
+let rtPausedUntil = 0;
+
+let imdbIdsResolvedSinceSave = 0;
+async function ensureImdbId(tmdbId) {
+  if (tmdbId in imdbIds) return imdbIds[tmdbId];
+  const resolved = await fetchImdbId(tmdbId);
+  imdbIds[tmdbId] = resolved;
+  if (++imdbIdsResolvedSinceSave % 20 === 0) saveImdbIdCache();
+  return resolved;
+}
+
+// ---------------------------------------------------------------------------
+// Secondary source #1: OMDb (Metacritic, plus an RT figure as a fallback).
+//
+// Everything below concerns OMDb alone. It reads the catalog and the IMDb id
+// cache, and touches no other source's state - so a rate limit, an invalid
+// key or an outage here delays Metacritic and nothing else.
+// ---------------------------------------------------------------------------
+
+/**
+ * Flags OMDb ratings older than OMDB_REFRESH_INTERVAL_HOURS as due for a
+ * re-check. Deliberately keeps the stored values visible until a fresh one
+ * replaces them, rather than blanking the column meanwhile.
+ */
+function markStaleOmdbRatings() {
+  const changed = markStale(omdbRatings.entries, Date.now(), OMDB_REFRESH_INTERVAL_MS);
   if (changed > 0) {
     debugLog(`[OMDb] ${changed} rating(s) marked stale (TTL ${OMDB_REFRESH_INTERVAL_HOURS}h), kept visible until rechecked`);
     saveOmdbCache();
@@ -1081,102 +1259,41 @@ function markStaleRatings() {
   return changed > 0;
 }
 
-/**
- * The RT equivalent of markStaleRatings, on its own (much shorter) interval -
- * see RT_REFRESH_INTERVAL_HOURS. Entries predating this feature have no
- * rtCheckedAt yet, so their general checkedAt stands in for it: that's when
- * the entry was last processed, which is when RT would have been scraped.
- */
-function markStaleRtRatings() {
-  if (!RT_SCRAPE_ENABLED) return false;
-  const now = Date.now();
-  let changed = 0;
-  for (const entry of Object.values(omdbRatings.entries)) {
-    if (entry.rtNeedsRefresh) continue;
-    if (isRatingStale(entry.rtCheckedAt ?? entry.checkedAt, now, RT_REFRESH_INTERVAL_MS)) {
-      entry.rtNeedsRefresh = true;
-      changed++;
-    }
-  }
-  if (changed > 0) {
-    debugLog(`[RT] ${changed} tomatometer(s) marked stale (TTL ${RT_REFRESH_INTERVAL_HOURS}h), kept visible until rechecked`);
-    saveOmdbCache();
-  }
-  return changed > 0;
-}
+/** Returns true if this pass did any work (so the engine loop knows not to idle-sleep). */
+async function processPendingOmdb() {
+  if (!OMDB_API_KEY) return false;
+  if (Date.now() < omdbPausedUntil) return false; // backing off, see omdbPausedUntil
 
-async function processPendingRatings() {
-  if (!OMDB_API_KEY && !RT_SCRAPE_ENABLED) return false;
-
-  // Never-checked movies first, stale-and-due-for-refresh ones after - see
-  // selectPendingOmdbIds and markStaleRatings. neverCheckedTotal is used
-  // below to tell a genuine coverage gap apart from a merely optional
-  // refresh once the daily quota gets hit mid-pass.
-  const { neverChecked, dueForRefresh, metacriticOnly } = splitPendingOmdbIds(omdbRatings.entries);
-  const pendingIds = [...neverChecked, ...dueForRefresh, ...metacriticOnly];
+  // Never-checked movies first, stale refreshes after - a tight daily quota
+  // should fill coverage gaps before re-confirming values already on screen.
+  const { neverChecked, dueForRefresh } = splitPendingIds(omdbRatings.entries);
+  const pendingIds = [...neverChecked, ...dueForRefresh];
   const neverCheckedTotal = neverChecked.length;
   if (pendingIds.length === 0) return false;
 
-  // Resolve the RT slugs for this whole pass up front, in batches, so the
-  // per-movie loop below only ever does the (unavoidable) page fetch.
-  // Movies whose IMDb id is still unknown at this point get their slug on
-  // the next pass, once fetchImdbId below has filled it in.
-  if (RT_SCRAPE_ENABLED) {
-    const slugsResolved = await resolveRtSlugs(pendingIds.map((id) => omdbRatings.entries[id]?.imdbId).filter(Boolean));
-    if (!slugsResolved && !OMDB_API_KEY) {
-      // Scraping is the only configured source and its id lookup is down.
-      // Backing off beats working through the whole list recording "N/A"s
-      // we never actually confirmed.
-      setOmdbStatus("error", `Wikidata (Rotten Tomatoes id lookup) is unreachable - retrying in ${OMDB_RETRY_INTERVAL_MINUTES} minute(s).`, {
-        pending: pendingIds.length,
-      });
-      await sleepOrWake(OMDB_RETRY_INTERVAL_MS);
-      return true;
-    }
-  }
-
   let processed = 0;
-  let rtScraped = 0; // how many tomatometers this pass actually fetched
-  // Set once OMDb reports its daily limit. With the RT scraper enabled this
-  // does NOT end the pass any more: OMDb is simply skipped for the rest of
-  // it while RT - which has no quota - keeps filling the column. Without
-  // the scraper there's nothing left to do, so the pass still backs off.
-  let omdbLimited = false;
   setOmdbStatus("checking_ratings", `Checking ratings: 0 / ${pendingIds.length}`, {
     processed: 0,
     total: pendingIds.length,
     pending: pendingIds.length,
   });
-  if (RT_SCRAPE_ENABLED) {
-    const rtDue = pendingIds.filter((pid) => {
-      const e = omdbRatings.entries[pid];
-      return e && (e.rt === "TODO" || e.needsRefresh || e.rtNeedsRefresh);
-    }).length;
-    setRtStatus("scraping", `Fetching tomatometers (${rtDue} queued) ...`, { pending: rtDue });
-  }
 
   for (const id of pendingIds) {
-    // A manual TMDb sync was requested (see /api/tmdb/refresh) - bail out
-    // now instead of finishing the entire (potentially long) OMDb pass
-    // first. Without this check, "Sync now" for TMDb could silently sit
-    // unnoticed for minutes (or up to OMDB_RETRY_INTERVAL_MINUTES, if
-    // currently waiting out a rate limit) behind an in-progress OMDb run,
-    // since wakeEngine() only interrupts the engine's *idle* wait, not an
-    // active processing pass like this one.
+    // A manual TMDb sync was requested - the primary source outranks both
+    // secondaries, so bail out and let the catalog refresh go first.
     if (forceTmdbRefresh) {
-      debugLog("[OMDb] Pausing rating checks - a manual TMDb sync was requested");
+      debugLog("[OMDb] Pausing - a manual TMDb sync was requested");
       saveOmdbCache();
+      saveImdbIdCache();
       return true;
     }
 
     const entry = omdbRatings.entries[id];
     if (!entry) continue; // removed in the meantime via a catalog refresh
 
-    if (!entry.imdbId) {
-      entry.imdbId = await fetchImdbId(id);
-    }
-
-    if (!entry.imdbId) {
+    const imdbId = await ensureImdbId(id);
+    if (!imdbId) {
+      // TMDb has no IMDb id for this movie, so OMDb can never answer for it.
       entry.rt = null;
       entry.metacritic = null;
       entry.checkedAt = new Date().toISOString();
@@ -1184,112 +1301,20 @@ async function processPendingRatings() {
       broadcast("upsert", buildMovieView(id));
       processed++;
     } else {
-      // Rotten Tomatoes first when enabled: it's the primary RT source and
-      // never throws (see fetchRtScore), so OMDb's limit/auth handling
-      // below stays exactly as it was. Only movies with a known slug AND an
-      // actually unknown/stale RT score cost a request - entries queued
-      // solely because they still owe a Metacritic score keep the RT value
-      // they already have instead of being re-scraped every pass.
-      let scrapedRt = null;
-      const rtWanted = entry.rt === "TODO" || entry.needsRefresh || entry.rtNeedsRefresh;
-      if (RT_SCRAPE_ENABLED && rtWanted && !rtSlugs[entry.imdbId]) {
-        // Wikidata knows no RT page for this film, so there is nothing to
-        // scrape. Still close out the RT side for this interval, otherwise
-        // the entry would re-queue itself on every single pass.
-        entry.rtCheckedAt = new Date().toISOString();
-        entry.rtNeedsRefresh = false;
-      }
-      if (RT_SCRAPE_ENABLED && rtWanted && rtSlugs[entry.imdbId]) {
-        const rtResult = await fetchRtScore(entry.imdbId);
-        await sleep(RT_REQUEST_DELAY_MS); // deliberately slow: this is someone else's website
-        if (rtResult.unavailable && !OMDB_API_KEY) {
-          // RT is the only source here and it's refusing/failing right now.
-          // Leave this movie pending instead of writing a "checked, N/A"
-          // that would stand until OMDB_REFRESH_INTERVAL_HOURS expires.
-          const remaining = pendingIds.length - processed;
-          setOmdbStatus("error", `Rotten Tomatoes is currently unreachable (${remaining} pending). Next attempt in ${OMDB_RETRY_INTERVAL_MINUTES} minute(s).`, {
-            processed,
-            total: pendingIds.length,
-            pending: remaining,
-          });
-          setRtStatus("error", "Rotten Tomatoes is currently unreachable.", { pending: remaining });
-          saveOmdbCache();
-          await sleepOrWake(OMDB_RETRY_INTERVAL_MS);
-          return true;
-        }
-        scrapedRt = rtResult.score;
-        if (!rtResult.unavailable) {
-          // The scrape completed (even if RT simply had no score) - that
-          // resets its own staleness clock, independently of whatever OMDb
-          // does with this entry below.
-          entry.rtCheckedAt = new Date().toISOString();
-          entry.rtNeedsRefresh = false;
-          rtScraped++;
-        }
-      }
-
-      // Bank the scraped score BEFORE talking to OMDb. An OMDb failure below
-      // must never discard a score RT already gave us - that's what made a
-      // rate-limited OMDb key stall the scraper completely: the exception
-      // fired before the assignment, so every pass re-scraped the same movie
-      // and threw the result away.
-      if (scrapedRt !== null) entry.rt = scrapedRt;
-
-      // OMDb is skipped entirely once it has reported its daily limit in
-      // this pass (or when no key is configured at all) - the RT scraper has
-      // no quota and carries on without it.
-      const omdbUsable = Boolean(OMDB_API_KEY) && !omdbLimited;
-      // An entry queued purely by RT's own (much shorter) staleness clock
-      // has perfectly fresh OMDb data - spending a request on it would put
-      // the daily quota right back in the critical path of every RT refresh,
-      // which is exactly what the separate interval and the RT-only "Sync
-      // now" exist to avoid.
-      const omdbWanted = entry.metacritic === "TODO" || entry.needsRefresh || entry.metacriticPending;
-
       try {
-        // OMDb still supplies Metacritic (and the RT fallback) whenever it's
-        // usable. Without it, only Metacritic is left owed - recorded via
-        // metacriticPending so a later pass can fill it in once quota is
-        // back, without the entry counting as an RT coverage gap.
-        const omdb = omdbUsable && omdbWanted ? await fetchOmdbRatings(entry.imdbId) : null;
-        if (omdb) {
-          // The scraper is the primary RT source, so OMDb's RT value must
-          // not overwrite a scraped one - including on a Metacritic-only
-          // catch-up pass, where the scrape was deliberately skipped because
-          // the stored RT score is still fresh. Letting OMDb win there would
-          // undo the scraper's work (and often blank the column, since OMDb
-          // has no RT value for many titles).
-          const keepScrapedRt = RT_SCRAPE_ENABLED && !rtWanted;
-          entry.rt = scrapedRt ?? (keepScrapedRt ? entry.rt : omdb.rt);
-          entry.metacritic = omdb.metacritic;
-          entry.metacriticPending = false;
-          entry.checkedAt = new Date().toISOString();
-          entry.needsRefresh = false;
-        } else if (!omdbWanted) {
-          // Queued for RT alone, with its OMDb side still fresh: nothing to
-          // do beyond the score already banked above. checkedAt is left
-          // untouched on purpose - that clock drives OMDb staleness, and
-          // bumping it on every (far more frequent) RT refresh would mean
-          // Metacritic never goes stale again.
-          entry.metacriticPending = Boolean(entry.metacriticPending);
-        } else {
-          entry.rt = scrapedRt ?? (entry.rt === "TODO" ? null : entry.rt);
-          if (entry.metacritic === "TODO") entry.metacritic = null;
-          entry.metacriticPending = Boolean(OMDB_API_KEY);
-          entry.checkedAt = new Date().toISOString();
-          entry.needsRefresh = false;
-        }
+        const { rt, metacritic } = await fetchOmdbRatings(imdbId);
+        entry.rt = rt;
+        entry.metacritic = metacritic;
+        entry.checkedAt = new Date().toISOString();
+        entry.needsRefresh = false;
         broadcast("upsert", buildMovieView(id));
         processed++;
         if (processed % 20 === 0) saveOmdbCache();
-        if (omdb) await sleep(OMDB_REQUEST_DELAY_MS);
+        await sleep(OMDB_REQUEST_DELAY_MS);
       } catch (err) {
         if (err instanceof OmdbAuthError) {
           // Distinct from OmdbLimitError on purpose: an invalid/revoked key
-          // will never resolve itself by waiting, unlike a daily limit. Still
-          // retries (the key might get fixed at any time), but the status
-          // message says so plainly instead of misleadingly claiming a
-          // temporary limit that's actually a permanent config problem.
+          // will never resolve itself by waiting, unlike a daily limit.
           const remaining = pendingIds.length - processed;
           setOmdbStatus(
             "error",
@@ -1297,62 +1322,38 @@ async function processPendingRatings() {
             { processed, total: pendingIds.length, pending: remaining }
           );
           saveOmdbCache();
+          saveImdbIdCache();
           console.error(`[OMDb] ${err.message}`);
-          await sleepOrWake(OMDB_RETRY_INTERVAL_MS);
+          omdbPausedUntil = Date.now() + OMDB_RETRY_INTERVAL_MS;
           return true;
         }
         if (err instanceof OmdbLimitError) {
           const remaining = pendingIds.length - processed;
-
-          if (RT_SCRAPE_ENABLED) {
-            // The scraper has no quota, so a limited OMDb is no reason to
-            // stop: drop OMDb for the rest of this pass and keep going on RT
-            // alone. This movie still gets recorded below with whatever RT
-            // gave us; only its Metacritic stays owed.
-            omdbLimited = true;
-            entry.rt = scrapedRt ?? (entry.rt === "TODO" ? null : entry.rt);
-            if (entry.metacritic === "TODO") entry.metacritic = null;
-            entry.metacriticPending = true;
-            entry.checkedAt = new Date().toISOString();
-            entry.needsRefresh = false;
-            broadcast("upsert", buildMovieView(id));
-            processed++;
-            saveOmdbCache();
-            debugLog(`[OMDb] Daily limit reached - continuing this pass on Rotten Tomatoes only (${remaining} left)`);
-          } else {
-            // pendingIds is ordered never-checked-first (see above), so as
-            // long as `processed` hasn't yet worked through all of
-            // neverCheckedTotal, some of `remaining` are genuine coverage
-            // gaps; anything beyond that is only the optional stale-refresh
-            // tail. Only the former is treated as a "problem" worth a red
-            // status - a backlog of pure refreshes of already-known ratings
-            // is a background nice-to-have, not something to alarm about.
-            const remainingNeverChecked = Math.max(0, neverCheckedTotal - processed);
-            if (remainingNeverChecked > 0) {
-              setOmdbStatus(
-                "waiting_for_limit_reset",
-                `OMDb daily limit reached (${remaining} pending, ${remainingNeverChecked} never checked). Next attempt in ${OMDB_RETRY_INTERVAL_MINUTES} minute(s) ...`,
-                { processed, total: pendingIds.length, pending: remaining }
-              );
-            } else {
-              setOmdbStatus(
-                "stale_refresh_pending",
-                `Every movie already has a rating; OMDb daily limit reached while refreshing ${remaining} stale one(s) in the background. Next attempt in ${OMDB_RETRY_INTERVAL_MINUTES} minute(s).`,
-                { processed, total: pendingIds.length, pending: remaining }
-              );
-            }
-            saveOmdbCache();
-            debugLog(
-              `[OMDb] Limit reached, waiting ${OMDB_RETRY_INTERVAL_MINUTES}min (${remaining} pending, ${remainingNeverChecked} never checked)`
+          // pendingIds is ordered never-checked-first, so anything beyond
+          // neverCheckedTotal is only the optional stale-refresh tail. A
+          // backlog of pure refreshes is a background nicety, not a problem
+          // worth a red status.
+          const remainingNeverChecked = Math.max(0, neverCheckedTotal - processed);
+          if (remainingNeverChecked > 0) {
+            setOmdbStatus(
+              "waiting_for_limit_reset",
+              `OMDb daily limit reached (${remaining} pending, ${remainingNeverChecked} never checked). Next attempt in ${OMDB_RETRY_INTERVAL_MINUTES} minute(s) ...`,
+              { processed, total: pendingIds.length, pending: remaining }
             );
-            // Wakeable: a manual TMDb sync (or, in principle, a future
-            // manual OMDb retry) can cut this wait short instead of forcing
-            // a full OMDB_RETRY_INTERVAL_MINUTES wait first.
-            await sleepOrWake(OMDB_RETRY_INTERVAL_MS);
-            return true; // the next engine tick retries the remaining ids (or prioritizes the TMDb sync)
+          } else {
+            setOmdbStatus(
+              "stale_refresh_pending",
+              `Every movie has an OMDb rating; the daily limit was reached while refreshing ${remaining} stale one(s). Next attempt in ${OMDB_RETRY_INTERVAL_MINUTES} minute(s).`,
+              { processed, total: pendingIds.length, pending: remaining }
+            );
           }
+          saveOmdbCache();
+          saveImdbIdCache();
+          debugLog(`[OMDb] Limit reached, pausing OMDb for ${OMDB_RETRY_INTERVAL_MINUTES}min (${remaining} pending) - other sources carry on`);
+          omdbPausedUntil = Date.now() + OMDB_RETRY_INTERVAL_MS;
+          return true;
         }
-        console.error(`Error for movie ID ${id}:`, err.message);
+        console.error(`OMDb error for movie ID ${id}:`, err.message);
         debugLog(`[OMDb] Error for ID ${id}: ${err.message}`);
       }
     }
@@ -1365,68 +1366,189 @@ async function processPendingRatings() {
   }
 
   saveOmdbCache();
-
-  if (RT_SCRAPE_ENABLED) {
-    setRtStatus("idle", `Tomatometers up to date (${rtScraped} fetched this pass).`, {
-      lastSync: new Date().toISOString(),
-      pending: 0,
-    });
-  }
-
-  if (omdbLimited) {
-    // The RT column is filled as far as this pass could take it, but OMDb
-    // still owes Metacritic for everything processed after the limit hit.
-    // Waiting out the retry interval before the next pass keeps that retry
-    // from turning into a tight loop (and, with it, needless RT traffic).
-    const owed = Object.values(omdbRatings.entries).filter((e) => e.metacriticPending).length;
-    setOmdbStatus(
-      "stale_refresh_pending",
-      `Ratings up to date via Rotten Tomatoes (${processed} checked). OMDb daily limit reached - ${owed} Metacritic score(s) still owed, next attempt in ${OMDB_RETRY_INTERVAL_MINUTES} minute(s).`,
-      { lastFullSync: new Date().toISOString(), pending: owed }
-    );
-    await sleepOrWake(OMDB_RETRY_INTERVAL_MS);
-    return true;
-  }
-
-  setOmdbStatus("idle", `All ratings up to date (${processed} checked).`, {
+  saveImdbIdCache();
+  setOmdbStatus("idle", `All OMDb ratings up to date (${processed} checked).`, {
     lastFullSync: new Date().toISOString(),
     pending: 0,
   });
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// Secondary source #2: Rotten Tomatoes (the tomatometer, scraped).
+//
+// A peer of the OMDb pass above, not a step inside it: its own cache, its
+// own interval, its own status row, its own retry. It never calls OMDb, and
+// OMDb's quota never applies to it.
+// ---------------------------------------------------------------------------
+
+/** RT's own staleness pass, on RT_REFRESH_INTERVAL_HOURS rather than OMDb's. */
+function markStaleRtScores() {
+  if (!RT_SCRAPE_ENABLED) return false;
+  const changed = markStale(rtScores.entries, Date.now(), RT_REFRESH_INTERVAL_MS);
+  if (changed > 0) {
+    debugLog(`[RT] ${changed} tomatometer(s) marked stale (TTL ${RT_REFRESH_INTERVAL_HOURS}h), kept visible until rechecked`);
+    saveRtCache();
+  }
+  return changed > 0;
+}
+
+/** Returns true if this pass did any work (so the engine loop knows not to idle-sleep). */
+async function processPendingRt() {
+  if (!RT_SCRAPE_ENABLED) return false;
+  if (Date.now() < rtPausedUntil) return false; // backing off, see rtPausedUntil
+
+  const { neverChecked, dueForRefresh } = splitPendingIds(rtScores.entries);
+  const pendingIds = [...neverChecked, ...dueForRefresh];
+  if (pendingIds.length === 0) return false;
+
+  // Resolve the IMDb ids first (cheap and cached), then the RT slugs for the
+  // whole pass in batches, so the per-movie loop only does the unavoidable
+  // page fetch.
+  const knownImdbIds = [];
+  for (const id of pendingIds) {
+    const imdbId = await ensureImdbId(id);
+    if (imdbId) knownImdbIds.push(imdbId);
+  }
+  saveImdbIdCache();
+
+  const slugsResolved = await resolveRtSlugs(knownImdbIds);
+  if (!slugsResolved) {
+    // Without the id mapping there is nothing to scrape. Back off rather
+    // than marking hundreds of movies "checked, no rating" we never checked.
+    setRtStatus("error", `Wikidata (Rotten Tomatoes id lookup) is unreachable - retrying in ${RT_RETRY_INTERVAL_MINUTES} minute(s).`, {
+      pending: pendingIds.length,
+    });
+    rtPausedUntil = Date.now() + RT_RETRY_INTERVAL_MS;
+    return true;
+  }
+
+  let processed = 0;
+  setRtStatus("scraping", `Fetching tomatometers: 0 / ${pendingIds.length}`, {
+    processed: 0,
+    total: pendingIds.length,
+    pending: pendingIds.length,
+  });
+
+  for (const id of pendingIds) {
+    if (forceTmdbRefresh) {
+      debugLog("[RT] Pausing - a manual TMDb sync was requested");
+      saveRtCache();
+      return true;
+    }
+
+    const entry = rtScores.entries[id];
+    if (!entry) continue; // removed in the meantime via a catalog refresh
+
+    const imdbId = imdbIds[id];
+    const slug = imdbId ? rtSlugs[imdbId] : null;
+    if (!slug) {
+      // No IMDb id, or Wikidata knows no RT page for it: a definitive "no
+      // tomatometer available", not a failed lookup.
+      entry.tomatometer = null;
+      entry.checkedAt = new Date().toISOString();
+      entry.needsRefresh = false;
+      broadcast("upsert", buildMovieView(id));
+      processed++;
+    } else {
+      const { score, unavailable } = await fetchRtScore(imdbId);
+      await sleep(RT_REQUEST_DELAY_MS); // deliberately slow: this is someone else's website
+      if (unavailable) {
+        // RT is throttling us or down. Leave this movie pending instead of
+        // recording a "checked, no rating" we never confirmed.
+        const remaining = pendingIds.length - processed;
+        setRtStatus("error", `Rotten Tomatoes is currently unreachable (${remaining} pending). Next attempt in ${RT_RETRY_INTERVAL_MINUTES} minute(s).`, {
+          processed,
+          total: pendingIds.length,
+          pending: remaining,
+        });
+        saveRtCache();
+        rtPausedUntil = Date.now() + RT_RETRY_INTERVAL_MS;
+        return true;
+      }
+      entry.tomatometer = score;
+      entry.checkedAt = new Date().toISOString();
+      entry.needsRefresh = false;
+      broadcast("upsert", buildMovieView(id));
+      processed++;
+      if (processed % 20 === 0) saveRtCache();
+    }
+
+    setRtStatus("scraping", `Fetching tomatometers: ${processed} / ${pendingIds.length}`, {
+      processed,
+      total: pendingIds.length,
+      pending: pendingIds.length - processed,
+    });
+  }
+
+  rtScores.lastFullSync = new Date().toISOString();
+  saveRtCache();
+  setRtStatus("idle", `All tomatometers up to date (${processed} fetched).`, {
+    lastSync: rtScores.lastFullSync,
+    pending: 0,
+  });
+  return true;
+}
+
+/**
+ * One tick: the primary source first (it decides which movies exist), then
+ * every secondary source, each in its OWN try/catch so no source can take
+ * another down with it. Adding a further rating source means adding one
+ * more block here - not threading it through an existing one.
+ */
 async function backgroundEngineLoop() {
   for (;;) {
     let didWork = false;
+    let catalogRefreshed = false;
+
+    // --- Primary: TMDb ---
     try {
       if (!TMDB_API_KEY) {
         setTmdbStatus("error", "TMDB_API_KEY is not set - engine paused.");
       } else {
         const tmdbDue =
           forceTmdbRefresh || tmdbCatalog.lastRefresh === 0 || Date.now() - tmdbCatalog.lastRefresh >= TMDB_REFRESH_INTERVAL_MS;
-
         if (tmdbDue) {
           forceTmdbRefresh = false;
           await refreshTmdbCatalog();
+          catalogRefreshed = true;
           didWork = true;
-        } else {
-          markStaleRatings();
-          markStaleRtRatings(); // own, shorter TTL - see RT_REFRESH_INTERVAL_HOURS
-          const processed = await processPendingRatings();
-          didWork = didWork || processed;
         }
       }
     } catch (err) {
-      console.error("Engine error:", err);
-      debugLog(`Engine error: ${err.stack || err.message}`);
+      console.error("TMDb engine error:", err);
+      debugLog(`TMDb engine error: ${err.stack || err.message}`);
       setTmdbStatus("error", `Engine error: ${err.message}`);
     }
 
-    // Deliberately a separate try/catch: a Trakt failure (e.g. a revoked
-    // token) must never interrupt TMDb/OMDb processing above.
+    // The secondaries only run on ticks where the catalog didn't just
+    // change under them; each is otherwise entirely independent of the
+    // others, in its own interval, its own status and its own failure mode.
+    if (!catalogRefreshed && TMDB_API_KEY) {
+      // --- Secondary: OMDb ---
+      try {
+        markStaleOmdbRatings();
+        didWork = (await processPendingOmdb()) || didWork;
+      } catch (err) {
+        console.error("OMDb engine error:", err);
+        debugLog(`OMDb engine error: ${err.stack || err.message}`);
+        setOmdbStatus("error", `OMDb error: ${err.message}`);
+      }
+
+      // --- Secondary: Rotten Tomatoes ---
+      try {
+        markStaleRtScores();
+        didWork = (await processPendingRt()) || didWork;
+      } catch (err) {
+        console.error("RT engine error:", err);
+        debugLog(`RT engine error: ${err.stack || err.message}`);
+        setRtStatus("error", `Rotten Tomatoes error: ${err.message}`);
+      }
+    }
+
+    // --- Secondary: Trakt (watched status, not a rating source) ---
     try {
-      const traktDidWork = await maybeSyncTrakt();
-      didWork = didWork || traktDidWork;
+      didWork = (await maybeSyncTrakt()) || didWork;
     } catch (err) {
       console.error("Trakt engine error:", err);
       debugLog(`Trakt engine error: ${err.stack || err.message}`);
