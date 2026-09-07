@@ -37,8 +37,8 @@ test("localizePhaseMessage: falls back to the raw server message for phases with
 });
 
 test("localizePhaseMessage: supports the rt provider, per language", () => {
-  const en = localizePhaseMessage("rt", { phase: "scraping", pending: 42 }, "en");
-  const de = localizePhaseMessage("rt", { phase: "scraping", pending: 42 }, "de");
+  const en = localizePhaseMessage("rt", { phase: "scraping", processed: 7, total: 42 }, "en");
+  const de = localizePhaseMessage("rt", { phase: "scraping", processed: 7, total: 42 }, "de");
   assert.match(en, /42/);
   assert.match(de, /42/);
   assert.notEqual(en, de);
@@ -65,13 +65,13 @@ test("formatLocalizedDate: formats a real date without throwing, for both langua
 });
 
 test("formatRatingTooltip: never-checked (no checkedAt) uses the dedicated placeholder", () => {
-  assert.equal(formatRatingTooltip(null, false, "en"), "Not checked against OMDb yet");
-  assert.equal(formatRatingTooltip(undefined, false, "de"), "Noch nicht bei OMDb geprüft");
+  assert.equal(formatRatingTooltip(null, false, "en"), "Not checked yet");
+  assert.equal(formatRatingTooltip(undefined, false, "de"), "Noch nicht geprüft");
 });
 
 test("formatRatingTooltip: a fresh, up-to-date rating shows just the checked date", () => {
   const iso = "2026-08-14T10:15:00.000Z";
-  assert.match(formatRatingTooltip(iso, false, "en"), /^OMDb rating checked: /);
+  assert.match(formatRatingTooltip(iso, false, "en"), /^Checked: /);
   assert.doesNotMatch(formatRatingTooltip(iso, false, "en"), /refresh pending/);
 });
 
@@ -94,7 +94,8 @@ test("projectMovieForLocale: picks the requested language's title/genres", () =>
     year: "1999",
     rt: 83,
     metacritic: 73,
-    ratingCheckedAt: "2026-08-14T10:15:00.000Z",
+    rtCheckedAt: "2026-08-14T10:15:00.000Z",
+    omdbCheckedAt: "2026-08-13T10:15:00.000Z",
     ratingNeedsRefresh: true,
     watched: "watched",
   };
@@ -106,7 +107,8 @@ test("projectMovieForLocale: picks the requested language's title/genres", () =>
   assert.equal(de.rt, 83);
   assert.equal(en.watched, "watched");
   assert.equal(de.watched, "watched");
-  assert.equal(en.ratingCheckedAt, "2026-08-14T10:15:00.000Z");
+  assert.equal(en.rtCheckedAt, "2026-08-14T10:15:00.000Z");
+  assert.equal(en.omdbCheckedAt, "2026-08-13T10:15:00.000Z");
   assert.equal(en.ratingNeedsRefresh, true);
 });
 

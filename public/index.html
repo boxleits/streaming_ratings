@@ -512,14 +512,18 @@
       const rt = formatScoreDisplay(movie.rt);
       const meta = formatScoreDisplay(movie.metacritic);
       const watched = formatWatchedDisplay(movie.watched);
-      const ratingTooltip = formatRatingTooltip(movie.ratingCheckedAt, movie.ratingNeedsRefresh, currentLang);
+      // One tooltip per column, from that column's own source: the RT cell
+      // reports when RT last looked (falling back to OMDb's timestamp when
+      // the value came from there), the Metacritic cell reports OMDb's.
+      const rtTooltip = formatRatingTooltip(movie.rtCheckedAt ?? movie.omdbCheckedAt, movie.ratingNeedsRefresh, currentLang);
+      const metaTooltip = formatRatingTooltip(movie.omdbCheckedAt, movie.ratingNeedsRefresh, currentLang);
       const tr = document.createElement("tr");
       tr.innerHTML = `
         <td class="col-title"><a href="${escapeHtml(movie.tmdbUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(movie.title)}</a></td>
         <td class="col-genre">${escapeHtml(movie.genres)}</td>
         <td class="col-year">${escapeHtml(movie.year)}</td>
-        <td class="col-score" title="${escapeHtml(ratingTooltip)}"><span class="${rt.cls}">${escapeHtml(rt.text)}${movie.rt !== "TODO" && movie.rt !== null ? "%" : ""}</span></td>
-        <td class="col-score" title="${escapeHtml(ratingTooltip)}"><span class="${meta.cls}">${escapeHtml(meta.text)}</span></td>
+        <td class="col-score" title="${escapeHtml(rtTooltip)}"><span class="${rt.cls}">${escapeHtml(rt.text)}${movie.rt !== "TODO" && movie.rt !== null ? "%" : ""}</span></td>
+        <td class="col-score" title="${escapeHtml(metaTooltip)}"><span class="${meta.cls}">${escapeHtml(meta.text)}</span></td>
         <td class="col-score"><span class="${watched.cls}">${escapeHtml(watched.text)}</span></td>
       `;
       resultBody.appendChild(tr);
@@ -782,15 +786,6 @@
       renderTable({ resetPaging: true });
     } else if (data.type === "upsert") {
       movieMap.set(data.id, data);
-      scheduleRender();
-    } else if (data.type === "ratings_reset") {
-      for (const id of data.ids) {
-        const m = movieMap.get(id);
-        if (m) {
-          m.rt = "TODO";
-          m.metacritic = "TODO";
-        }
-      }
       scheduleRender();
     } else if (data.type === "status") {
       applyEngineStatus(data.engineStatus);

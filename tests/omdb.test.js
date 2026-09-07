@@ -1,13 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import {
-  parseOmdbPayload,
-  isOmdbLimitResponse,
-  isOmdbAuthError,
-  isRatingStale,
-  selectPendingOmdbIds,
-  splitPendingOmdbIds,
-} from "../lib/omdb.js";
+import { parseOmdbPayload, isOmdbLimitResponse, isOmdbAuthError } from "../lib/omdb.js";
 
 test("parseOmdbPayload: reads RT and Metacritic from a normal response", () => {
   const data = {
@@ -78,102 +71,4 @@ test("isOmdbAuthError: a genuine daily-limit 401 is not misclassified as an auth
 test("isOmdbAuthError: false for non-401 statuses and missing data", () => {
   assert.equal(isOmdbAuthError(200, { Response: "False", Error: "Invalid API key!" }), false);
   assert.equal(isOmdbAuthError(401, null), false);
-});
-
-test("isRatingStale: never checked (falsy checkedAt) is not stale - it's a different priority tier", () => {
-  assert.equal(isRatingStale(null, Date.now(), 1000), false);
-  assert.equal(isRatingStale(undefined, Date.now(), 1000), false);
-});
-
-test("isRatingStale: true once the refresh interval has elapsed since the last check", () => {
-  const now = new Date("2026-08-24T12:00:00.000Z").getTime();
-  const checkedTwoHoursAgo = "2026-08-24T10:00:00.000Z";
-  const oneHourMs = 60 * 60 * 1000;
-  assert.equal(isRatingStale(checkedTwoHoursAgo, now, oneHourMs), true);
-  assert.equal(isRatingStale(checkedTwoHoursAgo, now, 3 * oneHourMs), false);
-});
-
-test("isRatingStale: unparseable checkedAt fails safe -> stale", () => {
-  assert.equal(isRatingStale("not-a-date", Date.now(), 1000), true);
-});
-
-test("selectPendingOmdbIds: never-checked movies come before stale-and-due-for-refresh ones", () => {
-  const entries = {
-    // Deliberately inserted in an order where the "due for refresh" one
-    // would come first if it were just a plain Object.keys() scan.
-    "1": { rt: 91, metacritic: 74, needsRefresh: true },
-    "2": { rt: "TODO", metacritic: "TODO" },
-    "3": { rt: "TODO", metacritic: "TODO" },
-    "4": { rt: null, metacritic: null, needsRefresh: true },
-  };
-  assert.deepEqual(selectPendingOmdbIds(entries), ["2", "3", "1", "4"]);
-});
-
-test("selectPendingOmdbIds: a fresh, already up-to-date rating is excluded", () => {
-  const entries = { "1": { rt: 91, metacritic: 74 }, "2": { rt: null, metacritic: null } };
-  assert.deepEqual(selectPendingOmdbIds(entries), []);
-});
-
-test("selectPendingOmdbIds: tolerates a missing/empty entries map", () => {
-  assert.deepEqual(selectPendingOmdbIds(null), []);
-  assert.deepEqual(selectPendingOmdbIds({}), []);
-});
-
-test("splitPendingOmdbIds: separates genuine coverage gaps from optional stale refreshes", () => {
-  const entries = {
-    "1": { rt: 91, metacritic: 74, needsRefresh: true },
-    "2": { rt: "TODO", metacritic: "TODO" },
-    "3": { rt: "TODO", metacritic: "TODO" },
-    "4": { rt: null, metacritic: null, needsRefresh: true },
-    "5": { rt: 50, metacritic: 60 }, // fresh, up to date - excluded from all tiers
-  };
-  const { neverChecked, dueForRefresh, metacriticOnly } = splitPendingOmdbIds(entries);
-  assert.deepEqual(neverChecked, ["2", "3"]);
-  assert.deepEqual(dueForRefresh, ["1", "4"]);
-  assert.deepEqual(metacriticOnly, []);
-});
-
-test("splitPendingOmdbIds: an entry that only still owes Metacritic is its own, lowest tier", () => {
-  const entries = {
-    "1": { rt: 83, metacritic: null, metacriticPending: true }, // RT known via the scraper, OMDb was rate-limited
-    "2": { rt: "TODO", metacritic: "TODO" },
-    "3": { rt: 70, metacritic: 65 },
-  };
-  const { neverChecked, dueForRefresh, metacriticOnly } = splitPendingOmdbIds(entries);
-  assert.deepEqual(neverChecked, ["2"]);
-  assert.deepEqual(dueForRefresh, []);
-  assert.deepEqual(metacriticOnly, ["1"]);
-});
-
-test("selectPendingOmdbIds: metacritic-only entries queue behind both other tiers", () => {
-  const entries = {
-    "1": { rt: 83, metacritic: null, metacriticPending: true },
-    "2": { rt: 91, metacritic: 74, needsRefresh: true },
-    "3": { rt: "TODO", metacritic: "TODO" },
-  };
-  assert.deepEqual(selectPendingOmdbIds(entries), ["3", "2", "1"]);
-});
-
-test("splitPendingOmdbIds: RT's own staleness flag queues an entry for a refresh too", () => {
-  const entries = {
-    "1": { rt: 83, metacritic: 70, rtNeedsRefresh: true }, // RT stale on its own, shorter TTL
-    "2": { rt: 60, metacritic: 55 }, // fresh on both
-  };
-  const { neverChecked, dueForRefresh, metacriticOnly } = splitPendingOmdbIds(entries);
-  assert.deepEqual(neverChecked, []);
-  assert.deepEqual(dueForRefresh, ["1"]);
-  assert.deepEqual(metacriticOnly, []);
-});
-
-test("splitPendingOmdbIds: an entry stale for both OMDb and RT is queued once, not twice", () => {
-  const entries = { "1": { rt: 83, metacritic: 70, needsRefresh: true, rtNeedsRefresh: true } };
-  assert.deepEqual(splitPendingOmdbIds(entries).dueForRefresh, ["1"]);
-  assert.deepEqual(selectPendingOmdbIds(entries), ["1"]);
-});
-
-test("splitPendingOmdbIds: a stale entry that also owes Metacritic is only counted once", () => {
-  const entries = { "1": { rt: 83, metacritic: null, needsRefresh: true, metacriticPending: true } };
-  const { dueForRefresh, metacriticOnly } = splitPendingOmdbIds(entries);
-  assert.deepEqual(dueForRefresh, ["1"], "the stale tier wins - it re-fetches both ratings anyway");
-  assert.deepEqual(metacriticOnly, []);
 });

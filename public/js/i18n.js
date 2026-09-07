@@ -32,9 +32,9 @@ const STRINGS = {
     moviesCountSuffix: (n) => `${n} movies`,
     lastFullSyncLabel: (date) => `Last full sync: ${date}`,
     pendingSuffix: (n) => `${n} pending`,
-    ratingNeverChecked: "Not checked against OMDb yet",
-    ratingChecked: (date) => `OMDb rating checked: ${date}`,
-    ratingCheckedStale: (date) => `OMDb rating checked: ${date} (refresh pending)`,
+    ratingNeverChecked: "Not checked yet",
+    ratingChecked: (date) => `Checked: ${date}`,
+    ratingCheckedStale: (date) => `Checked: ${date} (refresh pending)`,
     footerLine1:
       "Data sources: TMDb (catalog, availability, genres, movie page), OMDb (Rotten Tomatoes & Metacritic ratings).",
     footerLine2: "TODO = not checked yet \u00b7 N/A = checked, no rating available.",
@@ -59,7 +59,7 @@ const STRINGS = {
     },
     rtPhase: {
       idle: () => "Up to date",
-      scraping: (d) => `Fetching tomatometers (${d.pending ?? 0} queued) ...`,
+      scraping: (d) => `Fetching tomatometers: ${d.processed ?? 0} / ${d.total ?? 0}`,
     },
     traktPhase: {
       unauthorized: () => "Not connected",
@@ -92,9 +92,9 @@ const STRINGS = {
     moviesCountSuffix: (n) => `${n} Filme`,
     lastFullSyncLabel: (date) => `Zuletzt vollst\u00e4ndig: ${date}`,
     pendingSuffix: (n) => `${n} ausstehend`,
-    ratingNeverChecked: "Noch nicht bei OMDb gepr\u00fcft",
-    ratingChecked: (date) => `OMDb-Bewertung gepr\u00fcft: ${date}`,
-    ratingCheckedStale: (date) => `OMDb-Bewertung gepr\u00fcft: ${date} (Aktualisierung ausstehend)`,
+    ratingNeverChecked: "Noch nicht gepr\u00fcft",
+    ratingChecked: (date) => `Gepr\u00fcft: ${date}`,
+    ratingCheckedStale: (date) => `Gepr\u00fcft: ${date} (Aktualisierung ausstehend)`,
     footerLine1:
       "Datenquellen: TMDb (Katalog, Verf\u00fcgbarkeit, Genres, Filmseite), OMDb (Rotten-Tomatoes- & Metacritic-Wertung).",
     footerLine2: "TODO = noch nicht gepr\u00fcft \u00b7 N/A = gepr\u00fcft, keine Wertung vorhanden.",
@@ -119,7 +119,7 @@ const STRINGS = {
     },
     rtPhase: {
       idle: () => "Aktuell",
-      scraping: (d) => `Hole Tomatometer-Werte (${d.pending ?? 0} in Warteschlange) ...`,
+      scraping: (d) => `Hole Tomatometer-Werte: ${d.processed ?? 0} / ${d.total ?? 0}`,
     },
     traktPhase: {
       unauthorized: () => "Nicht verbunden",
@@ -151,11 +151,11 @@ export function localizePhaseMessage(provider, statusData, lang) {
 }
 
 /**
- * Builds the tooltip text for an RT/Metacritic cell: when its rating was
- * last checked against OMDb, or that it's never been checked, plus a note
- * when a background refresh of an already-known rating is pending (not a
- * coverage gap - see splitPendingOmdbIds/selectPendingOmdbIds in
- * lib/omdb.js for why that's a distinct, lower-urgency state).
+ * Builds the tooltip text for one rating cell: when THAT cell's source last
+ * checked, or that it hasn't yet, plus a note when a background refresh is
+ * pending (a lower-urgency state than a coverage gap - see
+ * lib/ratings.js's splitPendingIds). Each source has its own timestamp, so
+ * the caller passes the one belonging to the column being rendered.
  */
 export function formatRatingTooltip(checkedAtIso, needsRefresh, lang) {
   const strings = getStrings(lang);
@@ -200,7 +200,8 @@ export function projectMovieForLocale(movie, lang) {
     year: movie.year,
     rt: movie.rt,
     metacritic: movie.metacritic,
-    ratingCheckedAt: movie.ratingCheckedAt,
+    rtCheckedAt: movie.rtCheckedAt,
+    omdbCheckedAt: movie.omdbCheckedAt,
     ratingNeedsRefresh: movie.ratingNeedsRefresh,
     watched: movie.watched,
     tmdbUrl: buildTmdbMovieUrl(movie.id, lang),
