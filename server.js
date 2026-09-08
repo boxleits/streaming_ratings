@@ -4,6 +4,7 @@ import fs from "fs";
 import { fileURLToPath } from "url";
 import { OmdbLimitError, OmdbAuthError, isOmdbLimitResponse, isOmdbAuthError, parseOmdbPayload } from "./lib/omdb.js";
 import { splitPendingIds, markStale, mergeRatingView } from "./lib/ratings.js";
+import { extractMovieDetails, needsDetailsFetch } from "./lib/tmdb.js";
 import { buildRtUrl, parseRtPage, isRtTransientFailure } from "./lib/rottentomatoes.js";
 import { buildRtIdQuery, parseRtIdBindings } from "./lib/wikidata.js";
 import {
@@ -26,6 +27,11 @@ const OMDB_API_KEY = process.env.OMDB_API_KEY || "";
 const OMDB_REQUEST_DELAY_MS = parseInt(process.env.OMDB_REQUEST_DELAY_MS || "150", 10);
 const OMDB_RETRY_INTERVAL_MINUTES = parseFloat(process.env.OMDB_RETRY_INTERVAL_MINUTES || "30");
 const TMDB_REFRESH_INTERVAL_HOURS = parseFloat(process.env.TMDB_REFRESH_INTERVAL_HOURS || "24");
+// Per-movie detail lookups (IMDb id + primary release year) are throttled and
+// batched: TMDb has no daily quota, but a first run over a large catalog
+// shouldn't monopolise the engine loop either.
+const TMDB_REQUEST_DELAY_MS = parseInt(process.env.TMDB_REQUEST_DELAY_MS || "60", 10);
+const TMDB_DETAILS_BATCH_SIZE = parseInt(process.env.TMDB_DETAILS_BATCH_SIZE || "200", 10);
 const OMDB_REFRESH_INTERVAL_HOURS = parseFloat(process.env.OMDB_REFRESH_INTERVAL_HOURS || "168");
 const ENGINE_IDLE_MS = parseInt(process.env.ENGINE_IDLE_MS || "15000", 10);
 const CACHE_DIR = process.env.CACHE_DIR || path.join(__dirname, "data");
@@ -105,8 +111,11 @@ const RT_SLUG_CACHE_FILE = path.join(CACHE_DIR, "rt-slug-cache.json");
 // on its own - deleting rt-cache.json re-scrapes RT without touching a
 // single OMDb request, and vice versa.
 const RT_CACHE_FILE = path.join(CACHE_DIR, "rt-cache.json");
-// Primary-source data (TMDb external_ids), shared by both secondaries and Trakt.
-const IMDB_ID_CACHE_FILE = path.join(CACHE_DIR, "imdb-ids.json");
+// Per-movie primary-source facts from TMDb (IMDb id + primary release year),
+// shared by both secondaries and Trakt. Superseded imdb-ids.json, which is
+// migrated on startup.
+const TMDB_DETAILS_CACHE_FILE = path.join(CACHE_DIR, "tmdb-details.json");
+const LEGACY_IMDB_ID_CACHE_FILE = path.join(CACHE_DIR, "imdb-ids.json");
 
 function debugLog(...args) {
   if (!DEBUG_MODE) return;
@@ -163,10 +172,10 @@ function wakeEngine() {
 // The catalog switch happens ATOMICALLY (see refreshTmdbCatalog).
 // ---------------------------------------------------------------------------
 let tmdbCatalog = { movies: {}, lastRefresh: 0 };
-// tmdbId -> "tt..." | null. A primary-source fact (TMDb's external_ids), so
-// it lives with the catalog rather than inside either secondary's cache -
-// OMDb, RT and Trakt all read it, none of them owns it.
-let imdbIds = {};
+// tmdbId -> { imdbId, releaseYear, detailsCheckedAt }. Primary-source facts,
+// so they live with the catalog rather than inside either secondary's cache -
+// OMDb, RT and Trakt all read them, none of them owns them.
+let tmdbDetails = {};
 let omdbRatings = { entries: {}, lastFullSync: null };
 let rtScores = { entries: {}, lastFullSync: null };
 let forceTmdbRefresh = false;
@@ -211,23 +220,33 @@ function saveOmdbCache() {
   }
 }
 
-function loadImdbIdCache() {
+function loadTmdbDetailsCache() {
   try {
-    if (fs.existsSync(IMDB_ID_CACHE_FILE)) {
-      imdbIds = JSON.parse(fs.readFileSync(IMDB_ID_CACHE_FILE, "utf-8"));
-      debugLog(`IMDb id cache loaded: ${Object.keys(imdbIds).length} entries`);
+    if (fs.existsSync(TMDB_DETAILS_CACHE_FILE)) {
+      tmdbDetails = JSON.parse(fs.readFileSync(TMDB_DETAILS_CACHE_FILE, "utf-8"));
+      debugLog(`TMDb details cache loaded: ${Object.keys(tmdbDetails).length} entries`);
+      return;
+    }
+    // Older layout: a flat tmdbId -> imdbId map, with no release year. Keep
+    // the ids (they're still valid) but leave detailsCheckedAt unset, so each
+    // movie is re-fetched once to pick up its primary release year.
+    if (fs.existsSync(LEGACY_IMDB_ID_CACHE_FILE)) {
+      const legacy = JSON.parse(fs.readFileSync(LEGACY_IMDB_ID_CACHE_FILE, "utf-8"));
+      for (const [id, imdbId] of Object.entries(legacy)) tmdbDetails[id] = { imdbId, releaseYear: null };
+      console.log(`Migrated ${Object.keys(tmdbDetails).length} IMDb id(s) into tmdb-details.json; release years will be filled in.`);
+      saveTmdbDetailsCache();
     }
   } catch (err) {
-    console.error("Could not load IMDb id cache, starting empty:", err.message);
-    imdbIds = {};
+    console.error("Could not load TMDb details cache, starting empty:", err.message);
+    tmdbDetails = {};
   }
 }
-function saveImdbIdCache() {
+function saveTmdbDetailsCache() {
   try {
     fs.mkdirSync(CACHE_DIR, { recursive: true });
-    fs.writeFileSync(IMDB_ID_CACHE_FILE, JSON.stringify(imdbIds));
+    fs.writeFileSync(TMDB_DETAILS_CACHE_FILE, JSON.stringify(tmdbDetails));
   } catch (err) {
-    console.error("Could not save IMDb id cache:", err.message);
+    console.error("Could not save TMDb details cache:", err.message);
   }
 }
 
@@ -267,7 +286,7 @@ function migrateLegacyOmdbCache() {
     if (!entry) continue;
 
     if (entry.imdbId !== undefined) {
-      if (!(id in imdbIds)) imdbIds[id] = entry.imdbId;
+      if (!(id in tmdbDetails)) tmdbDetails[id] = { imdbId: entry.imdbId, releaseYear: null };
       delete entry.imdbId;
       movedIds++;
     }
@@ -308,7 +327,7 @@ function migrateLegacyOmdbCache() {
       `Migrated legacy cache: ${movedIds} IMDb id(s), ${movedRt} scraped RT score(s), ${owedMetacritic} pending Metacritic re-check(s).`
     );
     saveOmdbCache();
-    saveImdbIdCache();
+    saveTmdbDetailsCache();
     saveRtCache();
   }
 }
@@ -363,7 +382,7 @@ function reconcileSecondaryCaches() {
 }
 
 loadTmdbCache();
-loadImdbIdCache();
+loadTmdbDetailsCache();
 loadOmdbCache();
 loadRtCache();
 migrateLegacyOmdbCache();
@@ -440,7 +459,8 @@ function buildMovieView(id) {
   // Each source is read independently and merged only here, at the view
   // layer - see mergeRatingView for the precedence rule.
   const merged = mergeRatingView(omdbRatings.entries[id], rtScores.entries[id]);
-  const imdbId = imdbIds[id];
+  const details = tmdbDetails[id];
+  const imdbId = details?.imdbId;
   let watched = "N/A"; // Trakt not connected, or this movie's IMDb id isn't known yet
   if (TRAKT_CONFIGURED && traktAuth && imdbId) {
     watched = traktWatchedSet.has(imdbId) ? "watched" : "unseen";
@@ -448,7 +468,10 @@ function buildMovieView(id) {
   return {
     id,
     title: cat.title,
-    year: cat.year,
+    // TMDb's primary release year (what themoviedb.org prints after the
+    // title). cat.year is the region-scoped date discover returned - the
+    // German release - and only stands in until the details fetch lands.
+    year: details?.releaseYear || cat.year,
     genres: cat.genres,
     tmdbUrl: cat.tmdbUrl,
     rt: merged.rt,
@@ -779,15 +802,22 @@ async function fetchDiscoverPage(providerId, page, tmdbLocale) {
   return r.json();
 }
 
-async function fetchImdbId(tmdbMovieId) {
-  const url = `${TMDB_BASE}/movie/${tmdbMovieId}/external_ids?api_key=${TMDB_API_KEY}`;
+/**
+ * Fetches the per-movie primary-source facts in ONE request: the IMDb id and
+ * the primary release year. This deliberately uses `/movie/{id}` rather than
+ * `/movie/{id}/external_ids` - it costs exactly the same one request but also
+ * carries `release_date`, and unlike discover's region-scoped date that field
+ * is TMDb's primary release date, i.e. the year the website shows in
+ * parentheses after the title. See lib/tmdb.js.
+ */
+async function fetchMovieDetails(tmdbMovieId) {
+  const url = `${TMDB_BASE}/movie/${tmdbMovieId}?api_key=${TMDB_API_KEY}`;
   const t0 = Date.now();
   debugLog(`TMDb GET ${maskUrl(url)}`);
   const r = await fetch(url);
-  debugLog(`TMDb <- ${r.status} (${Date.now() - t0}ms) [external_ids ${tmdbMovieId}]`);
+  debugLog(`TMDb <- ${r.status} (${Date.now() - t0}ms) [details ${tmdbMovieId}]`);
   if (!r.ok) return null;
-  const data = await r.json();
-  return data.imdb_id || null;
+  return extractMovieDetails(await r.json());
 }
 
 async function fetchOmdbRatings(imdbId) {
@@ -1199,11 +1229,11 @@ async function refreshTmdbCatalog() {
     if (newIds.has(id)) continue;
     delete omdbRatings.entries[id];
     delete rtScores.entries[id];
-    delete imdbIds[id];
+    delete tmdbDetails[id];
   }
 
   saveTmdbCache();
-  saveImdbIdCache();
+  saveTmdbDetailsCache();
   saveOmdbCache();
   saveRtCache();
 
@@ -1228,13 +1258,67 @@ async function refreshTmdbCatalog() {
 let omdbPausedUntil = 0;
 let rtPausedUntil = 0;
 
-let imdbIdsResolvedSinceSave = 0;
-async function ensureImdbId(tmdbId) {
-  if (tmdbId in imdbIds) return imdbIds[tmdbId];
-  const resolved = await fetchImdbId(tmdbId);
-  imdbIds[tmdbId] = resolved;
-  if (++imdbIdsResolvedSinceSave % 20 === 0) saveImdbIdCache();
-  return resolved;
+let detailsResolvedSinceSave = 0;
+
+/**
+ * Resolves and caches a movie's primary-source details, returning its IMDb
+ * id. A failed fetch is not cached, so it's retried later rather than
+ * remembered as "this film has no IMDb id".
+ */
+async function ensureMovieDetails(tmdbId) {
+  const cached = tmdbDetails[tmdbId];
+  if (!needsDetailsFetch(cached)) return cached.imdbId;
+
+  const fetched = await fetchMovieDetails(tmdbId);
+  if (!fetched) return cached?.imdbId ?? null;
+
+  tmdbDetails[tmdbId] = { ...fetched, detailsCheckedAt: new Date().toISOString() };
+  if (++detailsResolvedSinceSave % 20 === 0) saveTmdbDetailsCache();
+  return fetched.imdbId;
+}
+
+/**
+ * Fills in per-movie primary-source details for catalog movies that don't
+ * have them yet. This is the PRIMARY source's own pass: the release year is
+ * shown for every movie whether or not any rating source is enabled, and
+ * caches predating this (which carry an IMDb id but no year) are backfilled
+ * without waiting for a secondary to touch each movie.
+ *
+ * Bounded per tick so a first run over a large catalog doesn't monopolise
+ * the loop - the remaining movies are picked up on the following ticks.
+ */
+async function processPendingTmdbDetails() {
+  if (!TMDB_API_KEY) return false;
+
+  const pending = Object.keys(tmdbCatalog.movies).filter((id) => needsDetailsFetch(tmdbDetails[id]));
+  if (pending.length === 0) return false;
+
+  const batch = pending.slice(0, TMDB_DETAILS_BATCH_SIZE);
+  setTmdbStatus("resolving_details", `Resolving release years and IMDb ids: 0 / ${pending.length}`, {
+    processed: 0,
+    total: pending.length,
+  });
+
+  let processed = 0;
+  for (const id of batch) {
+    if (forceTmdbRefresh) break; // a catalog refresh outranks this
+    await ensureMovieDetails(id);
+    processed++;
+    broadcast("upsert", buildMovieView(id));
+    await sleep(TMDB_REQUEST_DELAY_MS);
+  }
+
+  saveTmdbDetailsCache();
+  const remaining = pending.length - processed;
+  if (remaining > 0) {
+    setTmdbStatus("resolving_details", `Resolving release years and IMDb ids: ${processed} / ${pending.length}`, {
+      processed,
+      total: pending.length,
+    });
+  } else {
+    setTmdbStatus("idle", `Catalog up to date: ${Object.keys(tmdbCatalog.movies).length} movies on ${PROVIDER_NAME} (DE).`);
+  }
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1284,14 +1368,14 @@ async function processPendingOmdb() {
     if (forceTmdbRefresh) {
       debugLog("[OMDb] Pausing - a manual TMDb sync was requested");
       saveOmdbCache();
-      saveImdbIdCache();
+      saveTmdbDetailsCache();
       return true;
     }
 
     const entry = omdbRatings.entries[id];
     if (!entry) continue; // removed in the meantime via a catalog refresh
 
-    const imdbId = await ensureImdbId(id);
+    const imdbId = await ensureMovieDetails(id);
     if (!imdbId) {
       // TMDb has no IMDb id for this movie, so OMDb can never answer for it.
       entry.rt = null;
@@ -1322,7 +1406,7 @@ async function processPendingOmdb() {
             { processed, total: pendingIds.length, pending: remaining }
           );
           saveOmdbCache();
-          saveImdbIdCache();
+          saveTmdbDetailsCache();
           console.error(`[OMDb] ${err.message}`);
           omdbPausedUntil = Date.now() + OMDB_RETRY_INTERVAL_MS;
           return true;
@@ -1348,7 +1432,7 @@ async function processPendingOmdb() {
             );
           }
           saveOmdbCache();
-          saveImdbIdCache();
+          saveTmdbDetailsCache();
           debugLog(`[OMDb] Limit reached, pausing OMDb for ${OMDB_RETRY_INTERVAL_MINUTES}min (${remaining} pending) - other sources carry on`);
           omdbPausedUntil = Date.now() + OMDB_RETRY_INTERVAL_MS;
           return true;
@@ -1366,7 +1450,7 @@ async function processPendingOmdb() {
   }
 
   saveOmdbCache();
-  saveImdbIdCache();
+  saveTmdbDetailsCache();
   setOmdbStatus("idle", `All OMDb ratings up to date (${processed} checked).`, {
     lastFullSync: new Date().toISOString(),
     pending: 0,
@@ -1407,10 +1491,10 @@ async function processPendingRt() {
   // page fetch.
   const knownImdbIds = [];
   for (const id of pendingIds) {
-    const imdbId = await ensureImdbId(id);
+    const imdbId = await ensureMovieDetails(id);
     if (imdbId) knownImdbIds.push(imdbId);
   }
-  saveImdbIdCache();
+  saveTmdbDetailsCache();
 
   const slugsResolved = await resolveRtSlugs(knownImdbIds);
   if (!slugsResolved) {
@@ -1440,7 +1524,7 @@ async function processPendingRt() {
     const entry = rtScores.entries[id];
     if (!entry) continue; // removed in the meantime via a catalog refresh
 
-    const imdbId = imdbIds[id];
+    const imdbId = tmdbDetails[id]?.imdbId;
     const slug = imdbId ? rtSlugs[imdbId] : null;
     if (!slug) {
       // No IMDb id, or Wikidata knows no RT page for it: a definitive "no
@@ -1513,6 +1597,8 @@ async function backgroundEngineLoop() {
           await refreshTmdbCatalog();
           catalogRefreshed = true;
           didWork = true;
+        } else {
+          didWork = (await processPendingTmdbDetails()) || didWork;
         }
       }
     } catch (err) {

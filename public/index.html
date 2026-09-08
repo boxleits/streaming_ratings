@@ -625,6 +625,7 @@
     if (phase === "waiting_for_limit_reset") return "phase-bad";
     if (
       phase === "refreshing" ||
+      phase === "resolving_details" ||
       phase === "checking_ratings" ||
       phase === "awaiting_authorization" ||
       phase === "syncing" ||
@@ -645,7 +646,7 @@
     tmdbStatusText.innerHTML =
       `<span class="${phaseClass(tm.phase)}">${escapeHtml(tmdbMessage)}</span>` +
       `<span class="status-meta">${escapeHtml(t.lastLabel(formatLocalizedDate(tm.lastRefresh, currentLang)))} &nbsp;·&nbsp; ${escapeHtml(t.moviesCountSuffix(tm.movieCount ?? 0))}</span>`;
-    tmdbRefreshBtn.disabled = tm.phase === "refreshing";
+    tmdbRefreshBtn.disabled = tm.phase === "refreshing" || tm.phase === "resolving_details";
 
     const om = status.omdb;
     const omdbMessage = localizePhaseMessage("omdb", om, currentLang);
