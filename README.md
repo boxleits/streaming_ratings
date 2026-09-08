@@ -53,6 +53,8 @@ choice with the trade-offs spelled out in its own section.
 | `TRAKT_REFRESH_INTERVAL_HOURS` | no       | `24`                      | How often the watched-history sync re-runs once connected |
 | `PORT`                         | no       | `3000`                    | Server port |
 | `TMDB_REFRESH_INTERVAL_HOURS`  | no       | `24`                      | How often the entire catalog is reloaded from TMDb |
+| `TMDB_REQUEST_DELAY_MS`        | no       | `60`                      | Wait time between per-movie TMDb detail lookups (IMDb ID + release year) |
+| `TMDB_DETAILS_BATCH_SIZE`      | no       | `200`                     | How many movies get their details resolved per engine tick, so a first run over a large catalog doesn't monopolise the loop |
 | `OMDB_REFRESH_INTERVAL_HOURS`  | no       | `168` (7 days)            | How old an RT/Metacritic rating may get before it's automatically rechecked |
 | `OMDB_REQUEST_DELAY_MS`        | no       | `150`                     | Wait time between individual OMDb requests (rate-limit protection) |
 | `ENGINE_IDLE_MS`               | no       | `15000`                   | How long the engine waits when there's currently nothing to do |
@@ -176,10 +178,11 @@ would discard all prior progress (catalog + already-checked movies).
   fetched **once per supported UI language** (see "Language switching"
   below) and stored per movie as e.g. `title: { en: "...", de: "..." }`.
   **Fully replaced** on every `TMDB_REFRESH_INTERVAL_HOURS` cycle.
-- **`imdb-ids.json`** – TMDb movie ID → IMDb ID. Primary-source data
-  (TMDb's `external_ids`), so it lives with the catalog rather than inside
-  any one rating source: OMDb, the RT scraper and Trakt all read it, none
-  of them owns it. Misses are remembered too.
+- **`tmdb-details.json`** – TMDb movie ID → IMDb ID **and primary release
+  year**, both fetched in one `/movie/{id}` request. Primary-source data, so
+  it lives with the catalog rather than inside any one rating source: OMDb,
+  the RT scraper and Trakt all read it, none of them owns it. Misses are
+  remembered too. (Supersedes `imdb-ids.json`, migrated automatically.)
 - **`omdb-cache.json`** – OMDb's own ratings per movie (Metacritic, plus
   OMDb's RT figure). Language-independent (just numbers), updated per movie
   individually, on `OMDB_REFRESH_INTERVAL_HOURS`.
@@ -238,6 +241,27 @@ UI language, independently per browser:
   stays independent of the UI language — that's controlled separately via
   TMDb's `region`/`watch_region` parameters (hardcoded to `DE` in
   `server.js`), not by `SUPPORTED_LANGUAGES`.
+
+## Which year is shown
+
+The **Year** column is TMDb's **primary release date** — the year
+themoviedb.org prints in parentheses after the title.
+
+This is deliberately *not* the year from the catalog listing:
+`/discover/movie` scopes `release_date` to the request's `region` (`DE`
+here), so it reports the **German** release, which for films that opened
+late in a year abroad differs from the year TMDb itself displays. The year
+therefore comes from `/movie/{id}`, which returns the primary release date —
+and since that same request also carries the IMDb ID the app needs anyway,
+it costs **no extra requests**.
+
+Note that the primary release date is not always the earliest release
+anywhere in the world: a festival premiere can predate it. Matching what
+TMDb shows is the goal, so the primary release date is the right field.
+
+Until a movie's details have been fetched, the region-scoped year from the
+catalog is shown as a provisional value; the TMDb status row reports the
+progress of that backfill.
 
 ## Result table: TODO / N/A / rating
 
@@ -378,6 +402,9 @@ keys required), against extracted, pure logic:
 
 - **`tests/omdb.test.js`** – OMDb response parsing (RT/Metacritic
   extraction) and daily-limit detection (`lib/omdb.js`).
+- **`tests/tmdb.test.js`** – the primary source's pure parsing
+  (`lib/tmdb.js`): the release-year extraction (including malformed dates)
+  and when a cached details entry still needs fetching.
 - **`tests/ratings.test.js`** – the logic every secondary source shares
   (`lib/ratings.js`): staleness, the never-checked/stale work tiers, and the
   merge precedence between sources (including that enabling the scraper can
@@ -548,6 +575,7 @@ reach the host's Podman socket from within it.
 ```
 server.js                    Express app + background engine (entry point)
 lib/
+  tmdb.js                    Pure TMDb detail parsing: primary release year, IMDb id (tested, no network)
   ratings.js                 Source-agnostic rating logic shared by every secondary source:
                              staleness, work scheduling, the merge into one view (tested, no network)
   omdb.js                    Pure OMDb response parsing / limit detection (tested, no network)
@@ -574,8 +602,9 @@ playwright.config.js          E2E test config (auto-starts the server)
 - **One primary source, several independent secondary ones.**
 
   ```
-  TMDb (primary)          which movies exist, their titles/years/genres,
-    |                     and their IMDb IDs — everything else keys off this
+  TMDb (primary)          which movies exist, their titles/genres, their
+    |                     primary release year and their IMDb IDs —
+    |                     everything else keys off this
     +-- OMDb   (secondary)  Metacritic, plus an RT figure as a fallback
     +-- RT     (secondary)  the tomatometer, scraped
     +-- Trakt  (secondary)  watched status
@@ -701,7 +730,13 @@ restart `node server.js` (or use a file watcher of your choice, e.g.
 
 ## Migrating from an older version
 
-**Splitting the rating sources apart (latest change).** The single
+**Release year now comes from TMDb's primary release date (latest
+change).** `imdb-ids.json` is superseded by `tmdb-details.json`, which holds
+the IMDb ID *and* the primary release year. Existing IDs are migrated
+automatically at startup and each movie is re-fetched once to pick up its
+year — see "Which year is shown".
+
+**Splitting the rating sources apart.** The single
 `omdb-cache.json` entry used to carry the IMDb ID, *both* sources' ratings
 and both sources' timestamps. It's now split into `imdb-ids.json` (primary
 data), `omdb-cache.json` (OMDb's own ratings) and `rt-cache.json` (scraped

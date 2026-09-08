@@ -50,6 +50,7 @@ const STRINGS = {
       idle: () => "Up to date",
       refreshing: (d) =>
         d.totalPages ? `Loading catalog (${d.language ?? ""}), page ${d.page}/${d.totalPages} ...` : "Refreshing catalog ...",
+      resolving_details: (d) => `Resolving release years: ${d.processed ?? 0} / ${d.total ?? 0}`,
     },
     omdbPhase: {
       idle: () => "Up to date",
@@ -110,6 +111,7 @@ const STRINGS = {
       idle: () => "Aktuell",
       refreshing: (d) =>
         d.totalPages ? `Katalog laden (${d.language ?? ""}), Seite ${d.page}/${d.totalPages} ...` : "Katalog wird aktualisiert ...",
+      resolving_details: (d) => `Erscheinungsjahre werden ermittelt: ${d.processed ?? 0} / ${d.total ?? 0}`,
     },
     omdbPhase: {
       idle: () => "Aktuell",
