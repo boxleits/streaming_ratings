@@ -59,3 +59,27 @@ export function compareMovies(a, b, field, dir) {
 export function paginate(rows, count) {
   return rows.slice(0, Math.max(0, count));
 }
+
+/**
+ * Reads the current column filters straight off the filter inputs, which are
+ * the single source of truth for them.
+ *
+ * Deliberately not mirrored into a variable kept in sync by input events:
+ * browsers restore text inputs on a soft reload (F5), setting the visible
+ * value WITHOUT firing an input event. A mirrored copy therefore stayed
+ * empty while the box showed e.g. "60", leaving a filter that was plainly
+ * visible but had no effect at all. Reading the DOM at render time makes
+ * that state impossible.
+ *
+ * `documentRef` is injected rather than taken from the global, so this stays
+ * testable with a plain fake.
+ */
+export function readColumnFilters(documentRef) {
+  const filters = {};
+  const inputs = documentRef?.querySelectorAll?.(".filter-row input[data-filter]") || [];
+  for (const input of inputs) {
+    const field = input.getAttribute("data-filter");
+    if (field) filters[field] = input.value ?? "";
+  }
+  return filters;
+}

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { formatScore, passesColumnFilter, passesAllColumnFilters, compareMovies, paginate } from "../public/js/filters.js";
+import { formatScore, passesColumnFilter, passesAllColumnFilters, compareMovies, paginate, readColumnFilters } from "../public/js/filters.js";
 
 test("formatScore: TODO / N-A / number are distinguished correctly", () => {
   assert.deepEqual(formatScore("TODO"), { text: "TODO", cls: "score-todo" });
@@ -65,4 +65,44 @@ test("paginate: returns everything if count exceeds the row count", () => {
 test("paginate: treats a negative count as zero instead of throwing/slicing from the end", () => {
   const rows = [{ id: 1 }, { id: 2 }];
   assert.deepEqual(paginate(rows, -5), []);
+});
+
+// A minimal stand-in for the filter row: enough of the DOM API for
+// readColumnFilters, with no browser involved.
+function fakeDocument(inputs) {
+  return {
+    querySelectorAll: (selector) => {
+      if (selector !== ".filter-row input[data-filter]") return [];
+      return inputs.map(({ field, value }) => ({
+        getAttribute: (name) => (name === "data-filter" ? field : null),
+        value,
+      }));
+    },
+  };
+}
+
+test("readColumnFilters: reads every filter input's current value", () => {
+  const doc = fakeDocument([
+    { field: "title", value: "matrix" },
+    { field: "rt", value: "60" },
+    { field: "watched", value: "" },
+  ]);
+  assert.deepEqual(readColumnFilters(doc), { title: "matrix", rt: "60", watched: "" });
+});
+
+test("readColumnFilters: a value present without any input event still counts", () => {
+  // Exactly the state after a soft reload (F5): the browser restores the
+  // input's value and fires nothing. Reading the DOM is what makes that
+  // restored filter actually apply, instead of showing a filter that does
+  // nothing.
+  const doc = fakeDocument([{ field: "rt", value: "60" }]);
+  const movies = [{ rt: 92 }, { rt: 65 }, { rt: 30 }, { rt: "TODO" }, { rt: null }];
+  const matching = movies.filter((m) => passesAllColumnFilters(m, readColumnFilters(doc)));
+  assert.deepEqual(matching, [{ rt: 92 }, { rt: 65 }]);
+});
+
+test("readColumnFilters: tolerates a missing document or empty filter row", () => {
+  assert.deepEqual(readColumnFilters(undefined), {});
+  assert.deepEqual(readColumnFilters({}), {});
+  assert.deepEqual(readColumnFilters(fakeDocument([])), {});
 });

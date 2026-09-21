@@ -414,7 +414,9 @@ keys required), against extracted, pure logic:
   and the batched IMDb→RT-slug SPARQL query building/parsing
   (`lib/wikidata.js`), including that non-`tt…` ids can't reach the query.
 - **`tests/filters.test.js`** – the result table's column-filter and sort
-  logic (`public/js/filters.js`).
+  logic (`public/js/filters.js`), including that the filters are read
+  straight off the inputs, so a value the browser restored without firing an
+  input event still takes effect.
 - **`tests/connection.test.js`** – the SSE connection manager
   (`public/js/connection.js`), including a test that **reproduces exactly
   the mobile connection-drop scenario**: an `EventSource` that "dies
@@ -460,6 +462,17 @@ and tests, in `tests/e2e/mobile-reconnect.spec.js`:
   (`visibilitychange` event), independent of the watchdog timer.
 - **No unnecessary reconnect**: verifies that a healthy, visible
   connection does NOT keep reconnecting.
+
+And, in `tests/e2e/column-filters.spec.js`:
+
+- **Column filters apply**: typing a value filters the table, clearing it
+  restores every row, and "Clear column filters" empties all inputs.
+- **A filter already present on load applies too**: the page is served with
+  a filter input already carrying a value, reproducing what a browser leaves
+  behind when it restores the field on a soft reload (F5) — a visible value
+  that never fired an input event. This is the exact state that used to
+  render the table **unfiltered** while the box showed a filter, and it is
+  invisible to unit tests, which is why it is guarded here.
 
 The `?staleMs=...&watchdogMs=...` URL parameters are a test hook (see
 `public/index.html`) that shorten the watchdog time windows for fast,
