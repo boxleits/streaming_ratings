@@ -121,3 +121,64 @@ test("mergeRatingView: tolerates both entries being absent", () => {
   assert.equal(merged.rtCheckedAt, null);
   assert.equal(merged.omdbCheckedAt, null);
 });
+
+test("mergeRatingView: the Metacritic scraper wins the Meta column once it has checked", () => {
+  const merged = mergeRatingView(
+    { rt: 70, metacritic: 65, checkedAt: "2026-08-20T00:00:00.000Z" },
+    { tomatometer: 83, checkedAt: "2026-08-24T00:00:00.000Z" },
+    { metascore: 71, checkedAt: "2026-08-25T00:00:00.000Z" }
+  );
+  assert.equal(merged.metacritic, 71);
+  assert.equal(merged.rt, 83);
+  assert.equal(merged.mcCheckedAt, "2026-08-25T00:00:00.000Z");
+});
+
+test("mergeRatingView: Metacritic checked but with no score falls back to OMDb's figure", () => {
+  const merged = mergeRatingView(
+    { rt: 70, metacritic: 65, checkedAt: "2026-08-20T00:00:00.000Z" },
+    { checkedAt: null },
+    { metascore: null, checkedAt: "2026-08-25T00:00:00.000Z" }
+  );
+  assert.equal(merged.metacritic, 65, "enabling the scraper must never remove data OMDb already had");
+});
+
+test("mergeRatingView: a genuine Metascore of 0 survives the fallback chain", () => {
+  const merged = mergeRatingView(
+    { rt: null, metacritic: 40, checkedAt: "2026-08-20T00:00:00.000Z" },
+    { checkedAt: null },
+    { metascore: 0, checkedAt: "2026-08-25T00:00:00.000Z" }
+  );
+  assert.equal(merged.metacritic, 0, "0 is a score, not a missing value");
+});
+
+test("mergeRatingView: scrapers-only setup (no OMDb at all) fills both columns", () => {
+  const merged = mergeRatingView(
+    undefined,
+    { tomatometer: 83, checkedAt: "2026-08-24T00:00:00.000Z" },
+    { metascore: 71, checkedAt: "2026-08-24T00:00:00.000Z" }
+  );
+  assert.equal(merged.rt, 83);
+  assert.equal(merged.metacritic, 71, "this is what makes OMDb optional");
+  assert.equal(merged.omdbCheckedAt, null);
+});
+
+test("mergeRatingView: Metacritic not checked yet leaves OMDb's value in place", () => {
+  const merged = mergeRatingView(
+    { rt: 70, metacritic: 65, checkedAt: "2026-08-20T00:00:00.000Z" },
+    { checkedAt: null },
+    { metascore: null, checkedAt: null }
+  );
+  assert.equal(merged.metacritic, 65);
+  assert.equal(merged.mcCheckedAt, null);
+});
+
+test("mergeRatingView: a refresh pending on the Metacritic source is reported too", () => {
+  const merged = mergeRatingView({ checkedAt: "x" }, { checkedAt: "y" }, { checkedAt: "z", needsRefresh: true });
+  assert.equal(merged.ratingNeedsRefresh, true);
+});
+
+test("mergeRatingView: an omitted Metacritic entry behaves exactly as before the source existed", () => {
+  const merged = mergeRatingView({ rt: 70, metacritic: 65, checkedAt: "2026-08-20T00:00:00.000Z" }, { checkedAt: null });
+  assert.equal(merged.metacritic, 65);
+  assert.equal(merged.mcCheckedAt, null);
+});

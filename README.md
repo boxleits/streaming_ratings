@@ -23,17 +23,19 @@ regardless of whether a browser is currently connected:
 
 It does **not** scrape justwatch.com — the catalog and rating sources it
 uses by default (TMDb, OMDb, Trakt) all offer official, publicly documented
-APIs. The one exception is the **optional, off-by-default Rotten Tomatoes
-scraper** (`RT_SCRAPE_ENABLED`, see below), which exists only because Rotten
-Tomatoes has no public API at all any more; enabling it is a deliberate
-choice with the trade-offs spelled out in its own section.
+APIs. The exceptions are the two **optional, off-by-default scrapers** for
+Rotten Tomatoes (`RT_SCRAPE_ENABLED`) and Metacritic (`MC_SCRAPE_ENABLED`),
+which exist only because neither site has a public API any more and OMDb —
+the one API that carries both figures — hands out 1000 requests a day.
+Enabling them is a deliberate choice with the trade-offs spelled out in
+their own section; with both on, **OMDb becomes optional entirely**.
 
 ## Required API keys
 
 | Env var          | Source                                    | Free |
 |-------------------|--------------------------------------------|------|
 | `TMDB_API_KEY`    | https://www.themoviedb.org/settings/api    | yes  |
-| `OMDB_API_KEY`    | https://www.omdbapi.com/apikey.aspx        | yes (1000 requests/day, extendable via a Patreon tier) |
+| `OMDB_API_KEY` *(optional — see the scrapers below)* | https://www.omdbapi.com/apikey.aspx | yes (1000 requests/day, extendable via a Patreon tier) |
 | `TRAKT_CLIENT_ID` / `TRAKT_CLIENT_SECRET` (optional) | https://trakt.tv/oauth/applications (create an app; "Redirect URI" can be left as `urn:ietf:wg:oauth:2.0:oob` since the device-code flow doesn't use it) | yes |
 
 ## Environment variables
@@ -41,13 +43,20 @@ choice with the trade-offs spelled out in its own section.
 | Variable                      | Required | Default                | Description |
 |--------------------------------|----------|--------------------------|--------------|
 | `TMDB_API_KEY`                 | yes      | –                         | TMDb v3 API key |
-| `OMDB_API_KEY`                 | yes*     | –                         | OMDb API key. Without it (and without `RT_SCRAPE_ENABLED`), the catalog still works, but RT/Metacritic stay permanently "TODO". |
+| `OMDB_API_KEY`                 | no*      | –                         | OMDb API key. Optional: with `RT_SCRAPE_ENABLED` **and** `MC_SCRAPE_ENABLED` both columns are filled without it, and its status row disappears. Without it and without the scrapers, the catalog still works, but RT/Metacritic stay permanently "TODO". |
 | `OMDB_RETRY_INTERVAL_MINUTES`  | no       | `30`                      | How long OMDb pauses itself after hitting its daily limit. Only OMDb waits — every other source keeps running. |
-| `RT_SCRAPE_ENABLED`            | no       | `false`                   | `true`/`1` enables the optional Rotten Tomatoes scraper as the primary RT source — see "Rotten Tomatoes without OMDb" below. Works with or without an OMDb key. |
+| `RT_SCRAPE_ENABLED`            | no       | `false`                   | `true`/`1` enables the optional Rotten Tomatoes scraper as the primary RT source — see "Ratings without OMDb" below. Works with or without an OMDb key. |
 | `RT_REQUEST_DELAY_MS`          | no       | `1500`                    | Wait time between individual rottentomatoes.com page requests. Deliberately slow — don't lower it without reason. |
 | `RT_REFRESH_INTERVAL_HOURS`    | no       | `24`                      | How old a tomatometer may get before it's re-scraped. Independent of `OMDB_REFRESH_INTERVAL_HOURS` — scraping has no quota, so RT can refresh far more often than Metacritic. |
 | `RT_RETRY_INTERVAL_MINUTES`    | no       | `30`                      | How long RT backs off after Rotten Tomatoes or Wikidata is unreachable. Separate from `OMDB_RETRY_INTERVAL_MINUTES`: the two sources fail for unrelated reasons. |
 | `RT_USER_AGENT`                | no       | a descriptive default     | User-Agent sent to Wikidata/RT. Wikidata rejects generic clients, so keep it descriptive. |
+| `MC_SCRAPE_ENABLED`            | no       | `false`                   | `true`/`1` enables the optional Metacritic scraper as the primary Metascore source — see the scrapers section below. This is what makes an OMDb key unnecessary. |
+| `MC_REQUEST_DELAY_MS`          | no       | `1500`                    | Wait time between individual metacritic.com page requests. Deliberately slow — don't lower it without reason. |
+| `MC_REFRESH_INTERVAL_HOURS`    | no       | `24`                      | How old a Metascore may get before it's re-scraped. Its own knob, independent of RT's and of `OMDB_REFRESH_INTERVAL_HOURS`. |
+| `MC_RETRY_INTERVAL_MINUTES`    | no       | `30`                      | How long Metacritic backs off after metacritic.com or Wikidata is unreachable. Separate from RT's and OMDb's: the sources fail for unrelated reasons. |
+| `MC_USER_AGENT`                | no       | a descriptive default     | User-Agent sent to Wikidata/Metacritic. Wikidata rejects generic clients, so keep it descriptive. |
+| `WIKIDATA_REQUEST_DELAY_MS`    | no       | `1200`                    | Wait between consecutive SPARQL queries. query.wikidata.org enforces a per-client query budget, and a catalog-sized first run walks through several batches for each scraper. Paid once per catalog — the mappings are cached permanently. |
+| `WIKIDATA_BATCHES_PER_PASS`    | no       | `2`                       | How many id batches (200 movies each) one pass resolves before handing the engine loop back and scraping what it already has. A single Wikidata query can take well over a minute, so resolving a whole catalog in one pass would delay both the first score and every other source. |
 | `TRAKT_CLIENT_ID`              | no       | –                         | Trakt API app Client ID. Leave both Trakt vars unset to disable the feature entirely (the "Watched" column and Trakt status row are hidden). |
 | `TRAKT_CLIENT_SECRET`          | no       | –                         | Trakt API app Client Secret. Needed together with `TRAKT_CLIENT_ID` for the device-code OAuth flow. |
 | `TRAKT_REFRESH_INTERVAL_HOURS` | no       | `24`                      | How often the watched-history sync re-runs once connected |
@@ -62,7 +71,9 @@ choice with the trade-offs spelled out in its own section.
 | `CACHE_DIR`                    | no       | `/app/data`               | Directory for the cache files (see below) |
 | `DEBUG_MODE`                   | no       | `false`                   | `true`/`1` enables detailed console logging of every TMDb/OMDb/Trakt request |
 
-## Rotten Tomatoes without OMDb (optional, `RT_SCRAPE_ENABLED`)
+## Ratings without OMDb: the two scrapers (optional, opt-in)
+
+### Rotten Tomatoes (`RT_SCRAPE_ENABLED`)
 
 Rotten Tomatoes has **no public API** any more, and OMDb's free tier caps
 you at 1000 requests/day — which on a large catalog means the RT column can
@@ -93,28 +104,104 @@ Tomatoes movie page instead:
   running meanwhile), so an outage can't silently turn hundreds of movies
   into false "N/A"s.
 
-**Combining with OMDb:** the two are independent.
+### When the Wikidata id lookup fails
 
-- `RT_SCRAPE_ENABLED` **and** `OMDB_API_KEY`: the scraper is the primary RT
-  source, OMDb supplies Metacritic and acts as the RT fallback for anything
-  the scraper couldn't resolve.
-- `RT_SCRAPE_ENABLED` **without** `OMDB_API_KEY`: RT scores only, no
-  Metacritic (that column stays "N/A"), and no daily quota anywhere in the
-  loop.
+Both scrapers depend on one shared upstream for their id mapping, and
+`query.wikidata.org` enforces a **per-client query budget** — a first run
+over a large catalog is exactly the traffic shape that runs into it. What
+happens then:
 
-**Its own refresh cadence and its own "Sync now".** RT is not tied to
-`OMDB_REFRESH_INTERVAL_HOURS`: it has `RT_REFRESH_INTERVAL_HOURS` (24h by
-default, versus a week for OMDb), because scraping costs no quota and there's
-no reason to make a fresh tomatometer wait for Metacritic. The status panel
-has an **RT** row with its own "Sync now" button (`POST /api/rt/refresh`)
-that queues a re-scrape of `rt-cache.json` alone — re-scraping the whole
-catalog can't burn a single request of the OMDb quota, and OMDb's own
-staleness clock is untouched, so Metacritic still refreshes on schedule.
+- The status row **names the reason**, including the HTTP status
+  (`HTTP 429 (rate limited by Wikidata)`, `HTTP 403`, a network error), and
+  the same line is written to the server log. "Unreachable" on its own is
+  not something anyone can act on.
+- A throttled or briefly failing query (429/5xx) is **retried once** after a
+  short pause. When Wikidata sends a `Retry-After`, that wait is honoured
+  instead (clamped to between 1 minute and 6 hours) rather than the
+  source's own retry interval — and it is applied as a back-off timestamp,
+  never as a sleep inside the pass, so no other source is held up.
+- A failed lookup **does not stop the source**. Movies whose slug is already
+  cached are scraped as usual; only the ones still missing a mapping stay
+  pending, and the status says how many ("… 12 still need their Metacritic
+  id from Wikidata"). Mappings resolved before the failure are kept.
+
+**The first run over a large catalog is paced, not blocking.** A single
+SPARQL query regularly takes 10 seconds and can take well over a minute, and
+a 8000-movie catalog needs ~40 of them per scraper. So each pass resolves
+`WIKIDATA_BATCHES_PER_PASS` batches (400 movies by default), then goes
+straight on to scrape whatever is already mapped — scores start appearing
+within minutes instead of after the entire mapping is complete, and no other
+source is held up meanwhile. The status row shows that phase explicitly
+("Resolving Metacritic ids: 400 / 7935"), because a source that is working
+must never read as "up to date".
+
+### Metacritic, the same way (`MC_SCRAPE_ENABLED`)
+
+The Metascore was the last figure only OMDb could supply — and therefore
+the only reason left to live with its 1000-requests-a-day limit.
+`MC_SCRAPE_ENABLED=true` removes that reason, using the identical two-step
+approach one column over:
+
+1. **Wikidata** resolves IMDb ids → Metacritic slugs (property `P1712`,
+   the `movie/<slug>` form), batched the same way and cached permanently in
+   `mc-slug-cache.json`. Only `movie/...` ids are kept — `P1712` also holds
+   `game/`, `tv/` and `music/` ids, whose pages carry a Metascore for
+   something that isn't the film.
+2. The Metacritic page for each slug is fetched and parsed, throttled by
+   `MC_REQUEST_DELAY_MS` (1.5s by default).
+
+The same caveats apply, one-for-one: no API contract, a grey area with
+respect to the site's terms, opt-in for exactly those reasons, and every
+failure mode resolving to "no score" rather than an exception. One trap is
+specific to Metacritic and worth knowing about: every movie page shows
+**two** scores — the critics' Metascore (0-100, an integer) and the user
+score (0-10, with a decimal). The parser identifies the critics' score
+specifically and rejects anything decimal-shaped, so a markup change can
+make the column go empty but cannot quietly fill it with a user score
+(`lib/metacritic.js`, and the tests that pin exactly this down in
+`tests/metacritic.test.js`).
+
+**Combining with OMDb:** all three are independent.
+
+- **Both scrapers, no `OMDB_API_KEY`** — the point of all this: both
+  columns are filled, there is no daily quota anywhere in the loop, and
+  the OMDb status row disappears from the UI.
+- **Both scrapers *and* `OMDB_API_KEY`**: each scraper owns its column;
+  OMDb stays on purely as the fallback for whatever a scraper couldn't
+  resolve (no Wikidata entry, no page, a markup change). Its limit then
+  delays nothing but those leftovers.
+- **One scraper only**: that column comes off the site, the other one
+  needs OMDb — without a key it stays "TODO".
+
+Enabling a scraper never removes data: where it has no score of its own, a
+value OMDb already fetched stays on display.
+
+**Switching an existing deployment over** takes one variable and a restart:
+add `MC_SCRAPE_ENABLED=true` (alongside `RT_SCRAPE_ENABLED=true`), and drop
+`OMDB_API_KEY` if you want OMDb gone entirely. **No cache needs clearing.**
+Every movie simply gets an empty `mc-cache.json` entry on the next startup
+and is filled in by the new pass; whatever OMDb had already fetched stays
+visible in the meantime, and the Metascores replace it movie by movie as
+they arrive. Removing the OMDb key stops all OMDb requests but leaves
+`omdb-cache.json` in place, and its stored values keep serving as the
+fallback for anything the scrapers can't resolve — delete the file if you
+want those old figures gone too.
+
+**Each source has its own refresh cadence and its own "Sync now".** Neither
+scraper is tied to `OMDB_REFRESH_INTERVAL_HOURS`: they have
+`RT_REFRESH_INTERVAL_HOURS` and `MC_REFRESH_INTERVAL_HOURS` (24h by default,
+versus a week for OMDb), because scraping costs no quota and there is no
+reason to make a fresh tomatometer wait for a Metascore, or either wait for
+OMDb. The status panel gets an **RT** and a **Meta** row, each with its own
+"Sync now" button (`POST /api/rt/refresh`, `POST /api/mc/refresh`) that
+queues a re-scrape of that source's cache alone — re-scraping the whole
+catalog can't burn a single request of the OMDb quota, and no other source's
+staleness clock is touched.
 
 **When OMDb hits its daily limit**, it pauses *itself* for
-`OMDB_RETRY_INTERVAL_MINUTES` and the RT scraper keeps going at full speed —
-the two run as separate passes over separate caches, so neither one waiting
-holds up the other (nor the Trakt sync).
+`OMDB_RETRY_INTERVAL_MINUTES` and both scrapers keep going at full speed —
+each runs as a separate pass over a separate cache, so no source waiting
+holds up another (nor the Trakt sync).
 
 ## Trakt: "Watched" status (optional)
 
@@ -161,10 +248,16 @@ docker build -t prime-rt-finder .
 ```bash
 docker run -p 3000:3000 \
   -e TMDB_API_KEY=your_tmdb_key \
-  -e OMDB_API_KEY=your_omdb_key \
+  -e RT_SCRAPE_ENABLED=true \
+  -e MC_SCRAPE_ENABLED=true \
   -v prime_rt_cache:/app/data \
   prime-rt-finder
 ```
+
+That example runs **without an OMDb key at all** — both rating columns come
+off the scrapers. Add `-e OMDB_API_KEY=your_omdb_key` to keep OMDb on as a
+fallback, or use it instead of the two scraper flags for the API-only
+setup.
 
 The volume on `/app/data` is **recommended, bordering on necessary**:
 since the engine runs continuously, a container restart without a volume
@@ -193,6 +286,13 @@ would discard all prior progress (catalog + already-checked movies).
   Tomatoes slug, resolved via Wikidata. Never expires (the mapping is a
   stable fact about a film) and remembers misses too. Delete it to force a
   full re-resolve.
+- **`mc-cache.json`** *(only if `MC_SCRAPE_ENABLED`)* – the scraped
+  Metascore per movie, on its own `MC_REFRESH_INTERVAL_HOURS`. A peer of the
+  two above, not a part of either.
+- **`mc-slug-cache.json`** *(only if `MC_SCRAPE_ENABLED`)* – IMDb ID →
+  Metacritic slug (`movie/<slug>`), resolved via Wikidata. Same rules as
+  `rt-slug-cache.json`, separate file: the two mappings come from different
+  Wikidata properties, and one being absent says nothing about the other.
 - **`trakt-auth.json`** *(only if Trakt is configured)* – OAuth tokens for
   the single, server-wide Trakt connection. Sensitive — see "Trakt:
   Watched status" below.
@@ -328,8 +428,11 @@ network speed, especially on weaker CPUs like phones:
 
 ## Status display & manual sync
 
-Top right shows a panel per provider (TMDb / OMDb, plus **RT** when
-`RT_SCRAPE_ENABLED` and **Trakt** when Trakt is configured):
+Top right shows a panel per provider: TMDb, plus **OMDb** when
+`OMDB_API_KEY` is set, **RT** when `RT_SCRAPE_ENABLED`, **Meta** when
+`MC_SCRAPE_ENABLED` and **Trakt** when Trakt is configured. A source that
+isn't configured has no row at all — with both scrapers on and no OMDb key,
+the OMDb row is simply gone:
 
 - current phase (up to date / running / waiting for limit reset / error),
 - timestamp of that source's last full sync,
@@ -350,8 +453,8 @@ ones in the background") - not a problem, just a nice-to-have still
 catching up.
 
 Each source has its own "Sync now", which queues a re-check of **that
-source only** — OMDb's costs no scraping, RT's costs no OMDb quota. Neither
-blanks the table back to "TODO": the values on screen stay until fresh ones
+source only** — OMDb's costs no scraping, and neither scraper's costs a
+single OMDb request. None of them blanks the table back to "TODO": the values on screen stay until fresh ones
 replace them. A button is grayed out while that source is already working;
 an explicit "Sync now" also cancels that source's current back-off.
 
@@ -368,6 +471,11 @@ duration), e.g.:
 [DEBUG 2026-08-14T10:15:04.180Z] OMDb <- 200 (178ms) [tt1234567] Response=True Error=-
 ```
 
+With `MC_SCRAPE_ENABLED=true`, the Metacritic path logs in the same shape
+(`MC GET …` / `MC <- 200 (…ms) [tt0133093 movie/the-matrix] metascore=73`);
+a `metascore=-` on an otherwise healthy `200` is the same tell-tale sign of
+a markup change as below.
+
 With `RT_SCRAPE_ENABLED=true`, the Rotten Tomatoes path logs too — useful
 for spotting a markup change (a `tomatometer=-` on an otherwise healthy
 `200` is the tell-tale sign that RT changed its page and the parser needs
@@ -382,8 +490,12 @@ updating):
 
 ## Behavior when the OMDb daily limit is hit
 
-- The engine pauses rating checks and automatically retries every
-  `OMDB_RETRY_INTERVAL_MINUTES` minutes.
+*(Enabling both scrapers makes this section moot — that's what they're for.
+Without an OMDb key it doesn't apply at all.)*
+
+- **OMDb alone** pauses and automatically retries every
+  `OMDB_RETRY_INTERVAL_MINUTES` minutes. Every other source — both
+  scrapers and Trakt — keeps running at full speed meanwhile.
 - Already-checked movies are kept; only still-open ("TODO") movies get
   processed on the next attempt.
 - The status display shows "Waiting for OMDb limit reset" along with the
@@ -407,12 +519,18 @@ keys required), against extracted, pure logic:
   and when a cached details entry still needs fetching.
 - **`tests/ratings.test.js`** – the logic every secondary source shares
   (`lib/ratings.js`): staleness, the never-checked/stale work tiers, and the
-  merge precedence between sources (including that enabling the scraper can
-  never blank a value OMDb already had).
+  merge precedence between sources (including that enabling a scraper can
+  never blank a value OMDb already had, and that a scrapers-only setup
+  fills both columns).
 - **`tests/rottentomatoes.test.js`** – RT page parsing across every
   supported markup variant plus the fail-soft paths (`lib/rottentomatoes.js`),
   and the batched IMDb→RT-slug SPARQL query building/parsing
   (`lib/wikidata.js`), including that non-`tt…` ids can't reach the query.
+- **`tests/metacritic.test.js`** – the same for Metacritic
+  (`lib/metacritic.js`): every supported markup variant, the fail-soft
+  paths, the batched IMDb→Metacritic-slug queries (`P1712`, `movie/…` ids
+  only) — and, above all, that the 0-10 **user score** sitting next to the
+  Metascore on every page is never mistaken for it.
 - **`tests/filters.test.js`** – the result table's column-filter and sort
   logic (`public/js/filters.js`), including that the filters are read
   straight off the inputs, so a value the browser restored without firing an
@@ -594,7 +712,8 @@ lib/
   omdb.js                    Pure OMDb response parsing / limit detection (tested, no network)
   trakt.js                   Pure Trakt response parsing / OAuth-flow status helpers (tested, no network)
   rottentomatoes.js          Pure RT page parsing (multi-strategy, fail-soft) + failure classification (tested, no network)
-  wikidata.js                Pure SPARQL query building / result parsing for IMDb->RT slug mapping (tested, no network)
+  metacritic.js              Pure Metacritic page parsing (multi-strategy, fail-soft, critics-score-only) + failure classification (tested, no network)
+  wikidata.js                Pure SPARQL query building / result parsing for IMDb->RT/Metacritic slug mapping (tested, no network)
 public/
   index.html                 UI shell; loads the modules below via <script type="module">
   js/
@@ -618,8 +737,9 @@ playwright.config.js          E2E test config (auto-starts the server)
   TMDb (primary)          which movies exist, their titles/genres, their
     |                     primary release year and their IMDb IDs —
     |                     everything else keys off this
-    +-- OMDb   (secondary)  Metacritic, plus an RT figure as a fallback
     +-- RT     (secondary)  the tomatometer, scraped
+    +-- MC     (secondary)  the Metascore, scraped
+    +-- OMDb   (secondary)  both figures second-hand, as a fallback
     +-- Trakt  (secondary)  watched status
   ```
 
@@ -637,13 +757,14 @@ playwright.config.js          E2E test config (auto-starts the server)
   *when* it may try again and returns — it does not sleep inside its pass.
   Sleeping there would hold up every other source, which is precisely how a
   rate-limited OMDb key used to stall the RT scraper and the Trakt sync
-  along with it.
+  along with it. Each scraper has its own back-off timestamp for the same
+  reason: Metacritic refusing us must not slow down Rotten Tomatoes.
 - **The sources are merged only at the view layer**, in
-  `mergeRatingView`. The RT scraper wins the RT column once it has actually
-  checked, since it reads the score off Rotten Tomatoes itself while OMDb's
-  RT figure is a second-hand copy that's missing for many titles — but a
-  movie the scraper hasn't reached still falls back to OMDb's value, so
-  enabling the scraper never removes data.
+  `mergeRatingView`. Each scraper wins its own column once it has actually
+  checked, since it reads the score off the site itself while OMDb's figure
+  is a second-hand copy that's missing for many titles — but a movie a
+  scraper hasn't reached still falls back to OMDb's value, so enabling a
+  scraper never removes data.
 - **No request-driven scanning.** A single background loop
   (`backgroundEngineLoop` in `server.js`) runs continuously from process
   start, independent of HTTP requests.
@@ -709,7 +830,7 @@ is shown.
 ```bash
 npm install
 npm test              # fast unit tests, no network/keys needed
-npm start              # run the server locally (needs TMDB_API_KEY/OMDB_API_KEY)
+npm start              # run the server locally (needs TMDB_API_KEY; OMDB_API_KEY or the scrapers for ratings)
 npm run test:e2e       # slower, real-browser tests (needs a one-time Playwright browser install)
 ```
 
