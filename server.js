@@ -6,7 +6,8 @@ import { OmdbLimitError, OmdbAuthError, isOmdbLimitResponse, isOmdbAuthError, pa
 import { splitPendingIds, markStale, mergeRatingView } from "./lib/ratings.js";
 import { extractMovieDetails, needsDetailsFetch } from "./lib/tmdb.js";
 import { buildRtUrl, parseRtPage, isRtTransientFailure } from "./lib/rottentomatoes.js";
-import { buildRtIdQuery, parseRtIdBindings } from "./lib/wikidata.js";
+import { buildMetacriticUrl, parseMetacriticPage, isMetacriticTransientFailure } from "./lib/metacritic.js";
+import { buildRtIdQuery, parseRtIdBindings, buildMetacriticIdQuery, parseMetacriticIdBindings } from "./lib/wikidata.js";
 import {
   extractWatchedImdbIds,
   isDeviceAuthorizationPending,
@@ -38,12 +39,13 @@ const CACHE_DIR = process.env.CACHE_DIR || path.join(__dirname, "data");
 const PROVIDER_NAME = process.env.PROVIDER_NAME || "Amazon Prime Video";
 const DEBUG_MODE = /^(1|true|yes)$/i.test(process.env.DEBUG_MODE || "");
 
-// Rotten Tomatoes scraping: OPT-IN and off by default, because unlike every
-// other source here it is not a documented API (RT has no public one any
-// more) - it reads the public movie page and can break whenever RT changes
-// its markup. When enabled, it becomes the primary source for the RT score;
-// OMDb, if still configured, keeps supplying Metacritic and acts as the RT
-// fallback for anything the scraper couldn't resolve. See README.
+// The two scrapers: OPT-IN and off by default, because unlike every other
+// source here they are not documented APIs (neither site has a public one)
+// - they read the public movie page and can break whenever that site
+// changes its markup. When enabled, each becomes the primary source for its
+// own column; OMDb, if still configured, stays on as the fallback for
+// anything a scraper couldn't resolve. Enabling BOTH makes OMDb - and with
+// it its 1000-requests-a-day limit - optional entirely. See README.
 const RT_SCRAPE_ENABLED = /^(1|true|yes)$/i.test(process.env.RT_SCRAPE_ENABLED || "");
 const RT_REQUEST_DELAY_MS = parseInt(process.env.RT_REQUEST_DELAY_MS || "1500", 10);
 // RT gets its OWN, much shorter staleness interval than OMDb on purpose:
@@ -55,12 +57,24 @@ const RT_REFRESH_INTERVAL_HOURS = parseFloat(process.env.RT_REFRESH_INTERVAL_HOU
 // sources fail for unrelated reasons (a daily quota vs. a website being
 // unreachable) and shouldn't share a knob.
 const RT_RETRY_INTERVAL_MINUTES = parseFloat(process.env.RT_RETRY_INTERVAL_MINUTES || "30");
-// Sent on every rottentomatoes.com/wikidata.org request. Wikidata requires a
-// descriptive one (it 403s generic clients); RT gets the same courtesy so
-// the traffic is at least honestly attributable.
-const RT_USER_AGENT =
-  process.env.RT_USER_AGENT ||
+// Sent on every scraper/wikidata.org request. Wikidata requires a
+// descriptive one (it 403s generic clients); the scraped sites get the same
+// courtesy so the traffic is at least honestly attributable.
+const DEFAULT_SCRAPER_USER_AGENT =
   "prime-rt-finder/1.0 (self-hosted personal media dashboard; https://github.com/boxleits/streaming_ratings)";
+const RT_USER_AGENT = process.env.RT_USER_AGENT || DEFAULT_SCRAPER_USER_AGENT;
+
+// Metacritic scraping: the same deal as RT above, one column over. This is
+// what makes OMDb optional - the Metascore was the last thing only OMDb
+// could supply, and therefore the only reason to keep living with its daily
+// limit. Every knob is its OWN, not shared with RT's: the two sites fail
+// independently and there is no reason a Metacritic outage should change
+// how often RT is scraped.
+const MC_SCRAPE_ENABLED = /^(1|true|yes)$/i.test(process.env.MC_SCRAPE_ENABLED || "");
+const MC_REQUEST_DELAY_MS = parseInt(process.env.MC_REQUEST_DELAY_MS || "1500", 10);
+const MC_REFRESH_INTERVAL_HOURS = parseFloat(process.env.MC_REFRESH_INTERVAL_HOURS || "24");
+const MC_RETRY_INTERVAL_MINUTES = parseFloat(process.env.MC_RETRY_INTERVAL_MINUTES || "30");
+const MC_USER_AGENT = process.env.MC_USER_AGENT || DEFAULT_SCRAPER_USER_AGENT;
 
 // Trakt is entirely optional: a single, server-wide account (not per-user -
 // this app has no login system). If unset, the "Watched" column just stays
@@ -87,6 +101,8 @@ const WIKIDATA_SPARQL_BASE = "https://query.wikidata.org/sparql";
 const WIKIDATA_BATCH_SIZE = 200;
 const RT_REFRESH_INTERVAL_MS = RT_REFRESH_INTERVAL_HOURS * 3600 * 1000;
 const RT_RETRY_INTERVAL_MS = RT_RETRY_INTERVAL_MINUTES * 60 * 1000;
+const MC_REFRESH_INTERVAL_MS = MC_REFRESH_INTERVAL_HOURS * 3600 * 1000;
+const MC_RETRY_INTERVAL_MS = MC_RETRY_INTERVAL_MINUTES * 60 * 1000;
 const TMDB_REFRESH_INTERVAL_MS = TMDB_REFRESH_INTERVAL_HOURS * 3600 * 1000;
 const OMDB_REFRESH_INTERVAL_MS = OMDB_REFRESH_INTERVAL_HOURS * 3600 * 1000;
 const OMDB_RETRY_INTERVAL_MS = OMDB_RETRY_INTERVAL_MINUTES * 60 * 1000;
@@ -109,8 +125,12 @@ const TRAKT_WATCHED_FILE = path.join(CACHE_DIR, "trakt-watched.json");
 const RT_SLUG_CACHE_FILE = path.join(CACHE_DIR, "rt-slug-cache.json");
 // One file per source, so each can be inspected, reasoned about or deleted
 // on its own - deleting rt-cache.json re-scrapes RT without touching a
-// single OMDb request, and vice versa.
+// single OMDb request or Metacritic page, and so on for the others.
 const RT_CACHE_FILE = path.join(CACHE_DIR, "rt-cache.json");
+// The Metacritic pair, mirroring the RT one above: scores, and the
+// permanently cached IMDb id -> "movie/<slug>" mapping from Wikidata.
+const MC_CACHE_FILE = path.join(CACHE_DIR, "mc-cache.json");
+const MC_SLUG_CACHE_FILE = path.join(CACHE_DIR, "mc-slug-cache.json");
 // Per-movie primary-source facts from TMDb (IMDb id + primary release year),
 // shared by both secondaries and Trakt. Superseded imdb-ids.json, which is
 // migrated on startup.
@@ -157,17 +177,19 @@ function wakeEngine() {
 //   TMDb (primary)   which movies exist, their titles/years/genres, and
 //                    their IMDb ids. Everything else keys off this.
 //     |
-//     +-- OMDb (secondary)  Metacritic, plus an RT figure as a fallback
 //     +-- RT   (secondary)  the tomatometer, scraped
+//     +-- MC   (secondary)  the Metascore, scraped
+//     +-- OMDb (secondary)  both figures second-hand, as a fallback
 //
 // The secondaries are PEERS, not layers: each owns its own cache file, its
 // own refresh interval, its own status row and its own manual trigger, and
-// each is processed by its own pass in the engine loop. Neither can stall,
-// block or invalidate the other - an exhausted OMDb quota does not hold up
-// RT, and an unreachable RT does not hold up OMDb. lib/ratings.js holds the
-// parts that are the same for both (scheduling, staleness, the merge into
-// one view); everything below is deliberately duplicated per source rather
-// than shared, so the two stay independent.
+// each is processed by its own pass in the engine loop. None can stall,
+// block or invalidate another - an exhausted OMDb quota does not hold up
+// either scraper, and an unreachable RT does not hold up Metacritic.
+// lib/ratings.js holds the parts that are the same for all of them
+// (scheduling, staleness, the merge into one view); everything below is
+// deliberately duplicated per source rather than shared, so they stay
+// independent.
 //
 // The catalog switch happens ATOMICALLY (see refreshTmdbCatalog).
 // ---------------------------------------------------------------------------
@@ -178,6 +200,7 @@ let tmdbCatalog = { movies: {}, lastRefresh: 0 };
 let tmdbDetails = {};
 let omdbRatings = { entries: {}, lastFullSync: null };
 let rtScores = { entries: {}, lastFullSync: null };
+let mcScores = { entries: {}, lastFullSync: null };
 let forceTmdbRefresh = false;
 
 function loadTmdbCache() {
@@ -270,6 +293,26 @@ function saveRtCache() {
   }
 }
 
+function loadMcCache() {
+  try {
+    if (fs.existsSync(MC_CACHE_FILE)) {
+      mcScores = JSON.parse(fs.readFileSync(MC_CACHE_FILE, "utf-8"));
+      debugLog(`Metacritic cache loaded: ${Object.keys(mcScores.entries).length} entries`);
+    }
+  } catch (err) {
+    console.error("Could not load Metacritic cache, starting empty:", err.message);
+    mcScores = { entries: {}, lastFullSync: null };
+  }
+}
+function saveMcCache() {
+  try {
+    fs.mkdirSync(CACHE_DIR, { recursive: true });
+    fs.writeFileSync(MC_CACHE_FILE, JSON.stringify(mcScores));
+  } catch (err) {
+    console.error("Could not save Metacritic cache:", err.message);
+  }
+}
+
 /**
  * One-time migration from the pre-split cache, where a single omdb-cache.json
  * entry carried the IMDb id, both sources' ratings and both sources'
@@ -355,6 +398,32 @@ function saveRtSlugCache() {
   }
 }
 
+// imdbId -> "movie/<slug>" | null (null = Wikidata knows no Metacritic id
+// for it). Separate from rtSlugs on purpose: the two mappings come from
+// different Wikidata properties and one being absent says nothing about the
+// other.
+let mcSlugs = {};
+
+function loadMcSlugCache() {
+  try {
+    if (fs.existsSync(MC_SLUG_CACHE_FILE)) {
+      mcSlugs = JSON.parse(fs.readFileSync(MC_SLUG_CACHE_FILE, "utf-8"));
+      debugLog(`Metacritic slug cache loaded: ${Object.keys(mcSlugs).length} entries`);
+    }
+  } catch (err) {
+    console.error("Could not load Metacritic slug cache, starting empty:", err.message);
+    mcSlugs = {};
+  }
+}
+function saveMcSlugCache() {
+  try {
+    fs.mkdirSync(CACHE_DIR, { recursive: true });
+    fs.writeFileSync(MC_SLUG_CACHE_FILE, JSON.stringify(mcSlugs));
+  } catch (err) {
+    console.error("Could not save Metacritic slug cache:", err.message);
+  }
+}
+
 /**
  * The primary source owns the id set: every catalog movie gets an entry in
  * every secondary cache, and entries for movies that left the catalog are
@@ -373,11 +442,16 @@ function reconcileSecondaryCaches() {
       rtScores.entries[id] = { tomatometer: null, checkedAt: null };
       added++;
     }
+    if (!mcScores.entries[id]) {
+      mcScores.entries[id] = { metascore: null, checkedAt: null };
+      added++;
+    }
   }
   if (added > 0) {
     debugLog(`Reconciled secondary caches with the catalog: ${added} entr(ies) added`);
     saveOmdbCache();
     saveRtCache();
+    saveMcCache();
   }
 }
 
@@ -385,9 +459,11 @@ loadTmdbCache();
 loadTmdbDetailsCache();
 loadOmdbCache();
 loadRtCache();
+loadMcCache();
 migrateLegacyOmdbCache();
 reconcileSecondaryCaches();
 if (RT_SCRAPE_ENABLED) loadRtSlugCache();
+if (MC_SCRAPE_ENABLED) loadMcSlugCache();
 
 // ---------------------------------------------------------------------------
 // Trakt: single, server-wide account (see comment near TRAKT_CLIENT_ID).
@@ -458,7 +534,7 @@ function buildMovieView(id) {
   if (!cat) return null;
   // Each source is read independently and merged only here, at the view
   // layer - see mergeRatingView for the precedence rule.
-  const merged = mergeRatingView(omdbRatings.entries[id], rtScores.entries[id]);
+  const merged = mergeRatingView(omdbRatings.entries[id], rtScores.entries[id], mcScores.entries[id]);
   const details = tmdbDetails[id];
   const imdbId = details?.imdbId;
   let watched = "N/A"; // Trakt not connected, or this movie's IMDb id isn't known yet
@@ -477,6 +553,7 @@ function buildMovieView(id) {
     rt: merged.rt,
     metacritic: merged.metacritic,
     rtCheckedAt: merged.rtCheckedAt,
+    mcCheckedAt: merged.mcCheckedAt,
     omdbCheckedAt: merged.omdbCheckedAt,
     ratingNeedsRefresh: merged.ratingNeedsRefresh,
     watched,
@@ -504,9 +581,27 @@ function broadcast(type, payload = {}) {
 
 let engineStatus = {
   tmdb: { phase: "idle", message: "Not started yet.", updatedAt: null, lastRefresh: null, movieCount: 0 },
-  omdb: { phase: "idle", message: "Not started yet.", updatedAt: null, lastFullSync: null, pending: 0 },
+  // OMDb reports `configured` like the others now: with both scrapers on it
+  // is genuinely optional, and a row for a source that isn't set up would
+  // just be a permanent "not started yet".
+  omdb: {
+    configured: Boolean(OMDB_API_KEY),
+    phase: "idle",
+    message: "Not started yet.",
+    updatedAt: null,
+    lastFullSync: null,
+    pending: 0,
+  },
   rt: {
     configured: RT_SCRAPE_ENABLED,
+    phase: "idle",
+    message: "Not started yet.",
+    updatedAt: null,
+    lastSync: null,
+    pending: 0,
+  },
+  mc: {
+    configured: MC_SCRAPE_ENABLED,
     phase: "idle",
     message: "Not started yet.",
     updatedAt: null,
@@ -544,6 +639,21 @@ function setRtStatus(phase, message, extra = {}) {
   broadcast("status", { engineStatus });
 }
 
+function setMcStatus(phase, message, extra = {}) {
+  if (extra.lastSync) mcScores.lastFullSync = extra.lastSync;
+  engineStatus.mc = {
+    configured: MC_SCRAPE_ENABLED,
+    phase,
+    message,
+    updatedAt: new Date().toISOString(),
+    lastSync: mcScores.lastFullSync,
+    pending: extra.pending ?? engineStatus.mc.pending ?? 0,
+    processed: extra.processed,
+    total: extra.total,
+  };
+  broadcast("status", { engineStatus });
+}
+
 function setTmdbStatus(phase, message, extra = {}) {
   engineStatus.tmdb = {
     phase,
@@ -559,6 +669,7 @@ function setTmdbStatus(phase, message, extra = {}) {
 function setOmdbStatus(phase, message, extra = {}) {
   if (extra.lastFullSync) omdbRatings.lastFullSync = extra.lastFullSync;
   engineStatus.omdb = {
+    configured: Boolean(OMDB_API_KEY),
     phase,
     message,
     updatedAt: new Date().toISOString(),
@@ -589,9 +700,14 @@ function setTraktStatus(phase, message, extra = {}) {
 // Initial status values from the loaded cache, before the engine has
 // completed its first pass.
 setTmdbStatus("idle", tmdbCatalog.lastRefresh ? "Catalog loaded from cache." : "No catalog loaded yet.");
-setOmdbStatus("idle", omdbRatings.lastFullSync ? "Ratings loaded from cache." : "No ratings checked yet.");
+if (OMDB_API_KEY) {
+  setOmdbStatus("idle", omdbRatings.lastFullSync ? "Ratings loaded from cache." : "No ratings checked yet.");
+}
 if (RT_SCRAPE_ENABLED) {
   setRtStatus("idle", rtScores.lastFullSync ? "Tomatometers loaded from cache." : "No tomatometers fetched yet.");
+}
+if (MC_SCRAPE_ENABLED) {
+  setMcStatus("idle", mcScores.lastFullSync ? "Metascores loaded from cache." : "No Metascores fetched yet.");
 }
 if (TRAKT_CONFIGURED) {
   setTraktStatus(
@@ -608,6 +724,7 @@ app.get("/api/status", (req, res) => {
     tmdbConfigured: Boolean(TMDB_API_KEY),
     omdbConfigured: Boolean(OMDB_API_KEY),
     rtScrapeEnabled: RT_SCRAPE_ENABLED,
+    mcScrapeEnabled: MC_SCRAPE_ENABLED,
     traktConfigured: TRAKT_CONFIGURED,
     debugMode: DEBUG_MODE,
     providerName: PROVIDER_NAME,
@@ -655,6 +772,22 @@ app.post("/api/rt/refresh", (req, res) => {
   rtPausedUntil = 0; // an explicit "Sync now" outranks an ongoing back-off
   saveRtCache();
   setRtStatus("idle", `Manual Rotten Tomatoes sync triggered (${ids.length} movies queued).`, { pending: ids.length });
+  wakeEngine();
+  res.json({ ok: true, queued: true, count: ids.length });
+});
+
+app.post("/api/mc/refresh", (req, res) => {
+  if (!MC_SCRAPE_ENABLED) {
+    return res.status(400).json({ error: "MC_SCRAPE_ENABLED is not set." });
+  }
+  if (engineStatus.mc.phase === "scraping") {
+    return res.json({ ok: true, alreadyRunning: true });
+  }
+  const ids = Object.keys(mcScores.entries);
+  for (const id of ids) mcScores.entries[id].needsRefresh = true;
+  mcPausedUntil = 0; // an explicit "Sync now" outranks an ongoing back-off
+  saveMcCache();
+  setMcStatus("idle", `Manual Metacritic sync triggered (${ids.length} movies queued).`, { pending: ids.length });
   wakeEngine();
   res.json({ ok: true, queued: true, count: ids.length });
 });
@@ -921,6 +1054,90 @@ async function fetchRtScore(imdbId) {
     return { score: tomatometer, unavailable: false };
   } catch (err) {
     debugLog(`[RT] Fetch failed for ${imdbId} (${slug}): ${err.message}`);
+    return { score: null, unavailable: true };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Metacritic (opt-in, MC_SCRAPE_ENABLED): structurally identical to the RT
+// block above - Wikidata resolves IMDb ids -> "movie/<slug>" in batches
+// (property P1712), then the page for a slug is fetched and parsed, one
+// movie at a time, throttled by MC_REQUEST_DELAY_MS.
+//
+// Kept as its own pair of functions rather than folded into a generic
+// "scrape a site" helper: the two sites differ in what a miss means, in
+// which property holds their ids and in how their pages have to be read,
+// and sharing the plumbing would put a Metacritic markup change one edit
+// away from breaking RT as well.
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolves and caches Metacritic slugs for any of `imdbIds` not already
+ * known. Returns false if Wikidata was unreachable/refused, so the caller
+ * can tell "no slug because Wikidata doesn't have one" (a fact worth
+ * caching) apart from "no slug because the lookup itself failed" (must not
+ * be cached, and must not be recorded as a missing rating).
+ */
+async function resolveMcSlugs(imdbIds) {
+  const unknown = imdbIds.filter((id) => id && !(id in mcSlugs));
+  if (unknown.length === 0) return true;
+
+  for (let i = 0; i < unknown.length; i += WIKIDATA_BATCH_SIZE) {
+    const batch = unknown.slice(i, i + WIKIDATA_BATCH_SIZE);
+    const query = buildMetacriticIdQuery(batch);
+    if (!query) continue;
+
+    const url = `${WIKIDATA_SPARQL_BASE}?format=json&query=${encodeURIComponent(query)}`;
+    const t0 = Date.now();
+    debugLog(`Wikidata GET sparql [Metacritic, ${batch.length} ids]`);
+    try {
+      const r = await fetch(url, { headers: { Accept: "application/sparql-results+json", "User-Agent": MC_USER_AGENT } });
+      debugLog(`Wikidata <- ${r.status} (${Date.now() - t0}ms) [Metacritic, ${batch.length} ids]`);
+      if (!r.ok) return false; // leave them unresolved; next pass tries again
+      const data = await r.json().catch(() => null);
+      const found = parseMetacriticIdBindings(data);
+      for (const id of batch) {
+        // Remember misses as null too, so a film Wikidata simply doesn't
+        // cover doesn't get re-queried on every single pass.
+        mcSlugs[id] = found[id] ?? null;
+      }
+      saveMcSlugCache();
+    } catch (err) {
+      debugLog(`[MC] Wikidata batch failed: ${err.message}`);
+      return false; // network trouble - stop early, retry on the next pass
+    }
+  }
+  return true;
+}
+
+/**
+ * Fetches the Metacritic page for one IMDb id. Returns `{ score,
+ * unavailable }`, with the same meaning as fetchRtScore's: only a page that
+ * actually answered may be recorded as a checked "N/A".
+ */
+async function fetchMetascore(imdbId) {
+  const slug = mcSlugs[imdbId];
+  if (!slug) return { score: null, unavailable: false };
+
+  const url = buildMetacriticUrl(slug);
+  const t0 = Date.now();
+  debugLog(`MC GET ${url}`);
+  try {
+    const r = await fetch(url, { headers: { "User-Agent": MC_USER_AGENT, Accept: "text/html" } });
+    if (!r.ok) {
+      debugLog(`MC <- ${r.status} (${Date.now() - t0}ms) [${imdbId} ${slug}]`);
+      return { score: null, unavailable: isMetacriticTransientFailure(r.status) };
+    }
+    const html = await r.text();
+    const metascore = parseMetacriticPage(html);
+    debugLog(`MC <- ${r.status} (${Date.now() - t0}ms) [${imdbId} ${slug}] metascore=${metascore ?? "-"}`);
+    // A page that loaded but yielded nothing is treated as "no score on
+    // file". If Metacritic changed its markup, that's indistinguishable from
+    // here - which is why the scraper is opt-in and documented as
+    // best-effort.
+    return { score: metascore, unavailable: false };
+  } catch (err) {
+    debugLog(`[MC] Fetch failed for ${imdbId} (${slug}): ${err.message}`);
     return { score: null, unavailable: true };
   }
 }
@@ -1229,6 +1446,7 @@ async function refreshTmdbCatalog() {
     if (newIds.has(id)) continue;
     delete omdbRatings.entries[id];
     delete rtScores.entries[id];
+    delete mcScores.entries[id];
     delete tmdbDetails[id];
   }
 
@@ -1236,6 +1454,7 @@ async function refreshTmdbCatalog() {
   saveTmdbDetailsCache();
   saveOmdbCache();
   saveRtCache();
+  saveMcCache();
 
   debugLog(`[TMDb] Catalog refresh done: ${newIds.size} movies (${Date.now() - t0}ms)`);
   setTmdbStatus("idle", `Catalog up to date: ${newIds.size} movies on ${PROVIDER_NAME} (DE).`);
@@ -1257,6 +1476,7 @@ async function refreshTmdbCatalog() {
 // how a rate-limited OMDb used to stall RT and Trakt along with itself.
 let omdbPausedUntil = 0;
 let rtPausedUntil = 0;
+let mcPausedUntil = 0;
 
 let detailsResolvedSinceSave = 0;
 
@@ -1322,11 +1542,13 @@ async function processPendingTmdbDetails() {
 }
 
 // ---------------------------------------------------------------------------
-// Secondary source #1: OMDb (Metacritic, plus an RT figure as a fallback).
+// Secondary source #1: OMDb (both figures second-hand, as a fallback).
 //
 // Everything below concerns OMDb alone. It reads the catalog and the IMDb id
 // cache, and touches no other source's state - so a rate limit, an invalid
-// key or an outage here delays Metacritic and nothing else.
+// key or an outage here delays OMDb's own fallback values and nothing else.
+// With both scrapers enabled it can be left unconfigured entirely, which is
+// the point: its 1000 requests a day then stop being anyone's problem.
 // ---------------------------------------------------------------------------
 
 /**
@@ -1574,6 +1796,122 @@ async function processPendingRt() {
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// Secondary source #3: Metacritic (the Metascore, scraped).
+//
+// A peer of the two passes above, not a step inside either: its own cache,
+// its own interval, its own status row, its own retry. It never calls OMDb
+// or RT, and neither one's failures apply to it.
+// ---------------------------------------------------------------------------
+
+/** Metacritic's own staleness pass, on MC_REFRESH_INTERVAL_HOURS. */
+function markStaleMcScores() {
+  if (!MC_SCRAPE_ENABLED) return false;
+  const changed = markStale(mcScores.entries, Date.now(), MC_REFRESH_INTERVAL_MS);
+  if (changed > 0) {
+    debugLog(`[MC] ${changed} Metascore(s) marked stale (TTL ${MC_REFRESH_INTERVAL_HOURS}h), kept visible until rechecked`);
+    saveMcCache();
+  }
+  return changed > 0;
+}
+
+/** Returns true if this pass did any work (so the engine loop knows not to idle-sleep). */
+async function processPendingMc() {
+  if (!MC_SCRAPE_ENABLED) return false;
+  if (Date.now() < mcPausedUntil) return false; // backing off, see mcPausedUntil
+
+  const { neverChecked, dueForRefresh } = splitPendingIds(mcScores.entries);
+  const pendingIds = [...neverChecked, ...dueForRefresh];
+  if (pendingIds.length === 0) return false;
+
+  // Resolve the IMDb ids first (cheap and cached), then the Metacritic slugs
+  // for the whole pass in batches, so the per-movie loop only does the
+  // unavoidable page fetch.
+  const knownImdbIds = [];
+  for (const id of pendingIds) {
+    const imdbId = await ensureMovieDetails(id);
+    if (imdbId) knownImdbIds.push(imdbId);
+  }
+  saveTmdbDetailsCache();
+
+  const slugsResolved = await resolveMcSlugs(knownImdbIds);
+  if (!slugsResolved) {
+    // Without the id mapping there is nothing to scrape. Back off rather
+    // than marking hundreds of movies "checked, no rating" we never checked.
+    setMcStatus("error", `Wikidata (Metacritic id lookup) is unreachable - retrying in ${MC_RETRY_INTERVAL_MINUTES} minute(s).`, {
+      pending: pendingIds.length,
+    });
+    mcPausedUntil = Date.now() + MC_RETRY_INTERVAL_MS;
+    return true;
+  }
+
+  let processed = 0;
+  setMcStatus("scraping", `Fetching Metascores: 0 / ${pendingIds.length}`, {
+    processed: 0,
+    total: pendingIds.length,
+    pending: pendingIds.length,
+  });
+
+  for (const id of pendingIds) {
+    if (forceTmdbRefresh) {
+      debugLog("[MC] Pausing - a manual TMDb sync was requested");
+      saveMcCache();
+      return true;
+    }
+
+    const entry = mcScores.entries[id];
+    if (!entry) continue; // removed in the meantime via a catalog refresh
+
+    const imdbId = tmdbDetails[id]?.imdbId;
+    const slug = imdbId ? mcSlugs[imdbId] : null;
+    if (!slug) {
+      // No IMDb id, or Wikidata knows no Metacritic page for it: a
+      // definitive "no Metascore available", not a failed lookup.
+      entry.metascore = null;
+      entry.checkedAt = new Date().toISOString();
+      entry.needsRefresh = false;
+      broadcast("upsert", buildMovieView(id));
+      processed++;
+    } else {
+      const { score, unavailable } = await fetchMetascore(imdbId);
+      await sleep(MC_REQUEST_DELAY_MS); // deliberately slow: this is someone else's website
+      if (unavailable) {
+        // Metacritic is throttling us or down. Leave this movie pending
+        // instead of recording a "checked, no rating" we never confirmed.
+        const remaining = pendingIds.length - processed;
+        setMcStatus("error", `Metacritic is currently unreachable (${remaining} pending). Next attempt in ${MC_RETRY_INTERVAL_MINUTES} minute(s).`, {
+          processed,
+          total: pendingIds.length,
+          pending: remaining,
+        });
+        saveMcCache();
+        mcPausedUntil = Date.now() + MC_RETRY_INTERVAL_MS;
+        return true;
+      }
+      entry.metascore = score;
+      entry.checkedAt = new Date().toISOString();
+      entry.needsRefresh = false;
+      broadcast("upsert", buildMovieView(id));
+      processed++;
+      if (processed % 20 === 0) saveMcCache();
+    }
+
+    setMcStatus("scraping", `Fetching Metascores: ${processed} / ${pendingIds.length}`, {
+      processed,
+      total: pendingIds.length,
+      pending: pendingIds.length - processed,
+    });
+  }
+
+  mcScores.lastFullSync = new Date().toISOString();
+  saveMcCache();
+  setMcStatus("idle", `All Metascores up to date (${processed} fetched).`, {
+    lastSync: mcScores.lastFullSync,
+    pending: 0,
+  });
+  return true;
+}
+
 /**
  * One tick: the primary source first (it decides which movies exist), then
  * every secondary source, each in its OWN try/catch so no source can take
@@ -1629,6 +1967,16 @@ async function backgroundEngineLoop() {
         console.error("RT engine error:", err);
         debugLog(`RT engine error: ${err.stack || err.message}`);
         setRtStatus("error", `Rotten Tomatoes error: ${err.message}`);
+      }
+
+      // --- Secondary: Metacritic ---
+      try {
+        markStaleMcScores();
+        didWork = (await processPendingMc()) || didWork;
+      } catch (err) {
+        console.error("Metacritic engine error:", err);
+        debugLog(`Metacritic engine error: ${err.stack || err.message}`);
+        setMcStatus("error", `Metacritic error: ${err.message}`);
       }
     }
 

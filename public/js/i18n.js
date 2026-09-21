@@ -36,7 +36,7 @@ const STRINGS = {
     ratingChecked: (date) => `Checked: ${date}`,
     ratingCheckedStale: (date) => `Checked: ${date} (refresh pending)`,
     footerLine1:
-      "Data sources: TMDb (catalog, availability, genres, movie page), OMDb (Rotten Tomatoes & Metacritic ratings).",
+      "Data sources: TMDb (catalog, availability, genres, movie page), Rotten Tomatoes and Metacritic (their own scores, when the scrapers are enabled), OMDb (both scores as a fallback).",
     footerLine2: "TODO = not checked yet \u00b7 N/A = checked, no rating available.",
     footerLine3:
       'For the RT / Metacritic columns: a number in the filter (e.g. "60") shows only movies with at least that rating; text (e.g. "N/A") filters as a substring.',
@@ -61,6 +61,10 @@ const STRINGS = {
     rtPhase: {
       idle: () => "Up to date",
       scraping: (d) => `Fetching tomatometers: ${d.processed ?? 0} / ${d.total ?? 0}`,
+    },
+    mcPhase: {
+      idle: () => "Up to date",
+      scraping: (d) => `Fetching Metascores: ${d.processed ?? 0} / ${d.total ?? 0}`,
     },
     traktPhase: {
       unauthorized: () => "Not connected",
@@ -97,7 +101,7 @@ const STRINGS = {
     ratingChecked: (date) => `Gepr\u00fcft: ${date}`,
     ratingCheckedStale: (date) => `Gepr\u00fcft: ${date} (Aktualisierung ausstehend)`,
     footerLine1:
-      "Datenquellen: TMDb (Katalog, Verf\u00fcgbarkeit, Genres, Filmseite), OMDb (Rotten-Tomatoes- & Metacritic-Wertung).",
+      "Datenquellen: TMDb (Katalog, Verf\u00fcgbarkeit, Genres, Filmseite), Rotten Tomatoes und Metacritic (eigene Wertungen, sofern die Scraper aktiviert sind), OMDb (beide Wertungen als Fallback).",
     footerLine2: "TODO = noch nicht gepr\u00fcft \u00b7 N/A = gepr\u00fcft, keine Wertung vorhanden.",
     footerLine3:
       'Bei den Spalten RT / Metacritic: eine Zahl im Filter (z.\u00a0B. "60") zeigt nur Filme mit mindestens dieser Wertung; Text (z.\u00a0B. "N/A") filtert als Teilstring.',
@@ -123,6 +127,10 @@ const STRINGS = {
       idle: () => "Aktuell",
       scraping: (d) => `Hole Tomatometer-Werte: ${d.processed ?? 0} / ${d.total ?? 0}`,
     },
+    mcPhase: {
+      idle: () => "Aktuell",
+      scraping: (d) => `Hole Metascore-Werte: ${d.processed ?? 0} / ${d.total ?? 0}`,
+    },
     traktPhase: {
       unauthorized: () => "Nicht verbunden",
       awaiting_authorization: () => "Warte auf Best\u00e4tigung bei trakt.tv ...",
@@ -138,15 +146,21 @@ export function getStrings(lang) {
 }
 
 /**
- * Builds the display text for an engine status phase (tmdb, omdb, or
- * trakt), falling back to the raw server-provided message for phases
+ * Builds the display text for an engine status phase (tmdb, omdb, rt, mc
+ * or trakt), falling back to the raw server-provided message for phases
  * without a dedicated template (e.g. "error") - technical error text is
  * shown as-is regardless of UI language, since it may be an arbitrary
  * upstream error.
  */
 export function localizePhaseMessage(provider, statusData, lang) {
   const strings = getStrings(lang);
-  const table = { tmdb: strings.tmdbPhase, omdb: strings.omdbPhase, rt: strings.rtPhase, trakt: strings.traktPhase }[provider];
+  const table = {
+    tmdb: strings.tmdbPhase,
+    omdb: strings.omdbPhase,
+    rt: strings.rtPhase,
+    mc: strings.mcPhase,
+    trakt: strings.traktPhase,
+  }[provider];
   const fn = table && table[statusData.phase];
   if (fn) return fn(statusData);
   return statusData.message || "";
@@ -203,6 +217,7 @@ export function projectMovieForLocale(movie, lang) {
     rt: movie.rt,
     metacritic: movie.metacritic,
     rtCheckedAt: movie.rtCheckedAt,
+    mcCheckedAt: movie.mcCheckedAt,
     omdbCheckedAt: movie.omdbCheckedAt,
     ratingNeedsRefresh: movie.ratingNeedsRefresh,
     watched: movie.watched,

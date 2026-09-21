@@ -45,6 +45,15 @@ test("localizePhaseMessage: supports the rt provider, per language", () => {
   assert.equal(localizePhaseMessage("rt", { phase: "idle" }, "de"), "Aktuell");
 });
 
+test("localizePhaseMessage: supports the mc (Metacritic) provider, per language", () => {
+  const en = localizePhaseMessage("mc", { phase: "scraping", processed: 7, total: 42 }, "en");
+  const de = localizePhaseMessage("mc", { phase: "scraping", processed: 7, total: 42 }, "de");
+  assert.match(en, /42/);
+  assert.match(de, /42/);
+  assert.notEqual(en, de);
+  assert.equal(localizePhaseMessage("mc", { phase: "idle" }, "de"), "Aktuell");
+});
+
 test("localizePhaseMessage: supports the trakt provider too, per language", () => {
   const en = localizePhaseMessage("trakt", { phase: "awaiting_authorization" }, "en");
   const de = localizePhaseMessage("trakt", { phase: "awaiting_authorization" }, "de");
@@ -95,6 +104,7 @@ test("projectMovieForLocale: picks the requested language's title/genres", () =>
     rt: 83,
     metacritic: 73,
     rtCheckedAt: "2026-08-14T10:15:00.000Z",
+    mcCheckedAt: "2026-08-15T10:15:00.000Z",
     omdbCheckedAt: "2026-08-13T10:15:00.000Z",
     ratingNeedsRefresh: true,
     watched: "watched",
@@ -108,6 +118,7 @@ test("projectMovieForLocale: picks the requested language's title/genres", () =>
   assert.equal(en.watched, "watched");
   assert.equal(de.watched, "watched");
   assert.equal(en.rtCheckedAt, "2026-08-14T10:15:00.000Z");
+  assert.equal(en.mcCheckedAt, "2026-08-15T10:15:00.000Z", "each column's own source timestamp survives the projection");
   assert.equal(en.omdbCheckedAt, "2026-08-13T10:15:00.000Z");
   assert.equal(en.ratingNeedsRefresh, true);
 });
