@@ -56,6 +56,7 @@ their own section; with both on, **OMDb becomes optional entirely**.
 | `MC_RETRY_INTERVAL_MINUTES`    | no       | `30`                      | How long Metacritic backs off after metacritic.com or Wikidata is unreachable. Separate from RT's and OMDb's: the sources fail for unrelated reasons. |
 | `MC_USER_AGENT`                | no       | a descriptive default     | User-Agent sent to Wikidata/Metacritic. Wikidata rejects generic clients, so keep it descriptive. |
 | `WIKIDATA_REQUEST_DELAY_MS`    | no       | `1200`                    | Wait between consecutive SPARQL queries. query.wikidata.org enforces a per-client query budget, and a catalog-sized first run walks through several batches for each scraper. Paid once per catalog — the mappings are cached permanently. |
+| `WIKIDATA_BATCHES_PER_PASS`    | no       | `2`                       | How many id batches (200 movies each) one pass resolves before handing the engine loop back and scraping what it already has. A single Wikidata query can take well over a minute, so resolving a whole catalog in one pass would delay both the first score and every other source. |
 | `TRAKT_CLIENT_ID`              | no       | –                         | Trakt API app Client ID. Leave both Trakt vars unset to disable the feature entirely (the "Watched" column and Trakt status row are hidden). |
 | `TRAKT_CLIENT_SECRET`          | no       | –                         | Trakt API app Client Secret. Needed together with `TRAKT_CLIENT_ID` for the device-code OAuth flow. |
 | `TRAKT_REFRESH_INTERVAL_HOURS` | no       | `24`                      | How often the watched-history sync re-runs once connected |
@@ -123,6 +124,16 @@ happens then:
   cached are scraped as usual; only the ones still missing a mapping stay
   pending, and the status says how many ("… 12 still need their Metacritic
   id from Wikidata"). Mappings resolved before the failure are kept.
+
+**The first run over a large catalog is paced, not blocking.** A single
+SPARQL query regularly takes 10 seconds and can take well over a minute, and
+a 8000-movie catalog needs ~40 of them per scraper. So each pass resolves
+`WIKIDATA_BATCHES_PER_PASS` batches (400 movies by default), then goes
+straight on to scrape whatever is already mapped — scores start appearing
+within minutes instead of after the entire mapping is complete, and no other
+source is held up meanwhile. The status row shows that phase explicitly
+("Resolving Metacritic ids: 400 / 7935"), because a source that is working
+must never read as "up to date".
 
 ### Metacritic, the same way (`MC_SCRAPE_ENABLED`)
 

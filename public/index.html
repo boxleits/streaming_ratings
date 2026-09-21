@@ -635,6 +635,8 @@
       phase === "refreshing" ||
       phase === "resolving_details" ||
       phase === "checking_ratings" ||
+      phase === "resolving_ids" ||
+      phase === "queued" ||
       phase === "awaiting_authorization" ||
       phase === "syncing" ||
       phase === "stale_refresh_pending"
@@ -663,7 +665,12 @@
     omdbStatusRow.style.display = om && om.configured === false ? "none" : "grid";
     const omdbMessage = localizePhaseMessage("omdb", om, currentLang);
     let omdbExtra = t.lastFullSyncLabel(formatLocalizedDate(om.lastFullSync, currentLang));
-    if (om.phase === "waiting_for_limit_reset" || om.phase === "checking_ratings" || om.phase === "stale_refresh_pending") {
+    if (
+      om.phase === "waiting_for_limit_reset" ||
+      om.phase === "checking_ratings" ||
+      om.phase === "stale_refresh_pending" ||
+      om.phase === "queued"
+    ) {
       omdbExtra += ` &nbsp;·&nbsp; ${escapeHtml(t.pendingSuffix(om.pending ?? 0))}`;
     }
     omdbStatusText.innerHTML =
@@ -678,10 +685,12 @@
       rtStatusRow.style.display = "grid";
       const rtMessage = localizePhaseMessage("rt", rt, currentLang);
       let rtExtra = escapeHtml(t.lastFullSyncLabel(formatLocalizedDate(rt.lastSync, currentLang)));
-      if (rt.phase === "scraping") rtExtra += ` &nbsp;·&nbsp; ${escapeHtml(t.pendingSuffix(rt.pending ?? 0))}`;
+      if (rt.phase === "scraping" || rt.phase === "resolving_ids" || rt.phase === "queued") {
+        rtExtra += ` &nbsp;·&nbsp; ${escapeHtml(t.pendingSuffix(rt.pending ?? 0))}`;
+      }
       rtStatusText.innerHTML =
         `<span class="${phaseClass(rt.phase)}">${escapeHtml(rtMessage)}</span>` + `<span class="status-meta">${rtExtra}</span>`;
-      rtRefreshBtn.disabled = rt.phase === "scraping";
+      rtRefreshBtn.disabled = rt.phase === "scraping" || rt.phase === "resolving_ids";
     }
 
     // Same again for the (opt-in) Metacritic scraper.
@@ -692,10 +701,12 @@
       mcStatusRow.style.display = "grid";
       const mcMessage = localizePhaseMessage("mc", mc, currentLang);
       let mcExtra = escapeHtml(t.lastFullSyncLabel(formatLocalizedDate(mc.lastSync, currentLang)));
-      if (mc.phase === "scraping") mcExtra += ` &nbsp;·&nbsp; ${escapeHtml(t.pendingSuffix(mc.pending ?? 0))}`;
+      if (mc.phase === "scraping" || mc.phase === "resolving_ids" || mc.phase === "queued") {
+        mcExtra += ` &nbsp;·&nbsp; ${escapeHtml(t.pendingSuffix(mc.pending ?? 0))}`;
+      }
       mcStatusText.innerHTML =
         `<span class="${phaseClass(mc.phase)}">${escapeHtml(mcMessage)}</span>` + `<span class="status-meta">${mcExtra}</span>`;
-      mcRefreshBtn.disabled = mc.phase === "scraping";
+      mcRefreshBtn.disabled = mc.phase === "scraping" || mc.phase === "resolving_ids";
     }
 
     const tr = status.trakt;

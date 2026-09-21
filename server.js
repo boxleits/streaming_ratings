@@ -118,6 +118,14 @@ const WIKIDATA_REQUEST_DELAY_MS = parseInt(process.env.WIKIDATA_REQUEST_DELAY_MS
 // source's own back-off timestamp, because sleeping inside a pass holds up
 // every other source (see omdbPausedUntil/rtPausedUntil/mcPausedUntil).
 const WIKIDATA_RETRY_PAUSE_MS = 2000;
+// How many SPARQL batches one pass may work through before handing the loop
+// back. A first run over a full catalog needs dozens of them, and a single
+// query can take well over a minute when Wikidata is busy - resolving the
+// whole mapping in one pass would hold up every other source for as long as
+// that takes, and delay the first score by just as long. Bounded here, each
+// pass resolves a little and then scrapes whatever is already mapped; the
+// next pass continues where this one left off (the mapping is cached).
+const WIKIDATA_BATCHES_PER_PASS = parseInt(process.env.WIKIDATA_BATCHES_PER_PASS || "2", 10);
 const RT_REFRESH_INTERVAL_MS = RT_REFRESH_INTERVAL_HOURS * 3600 * 1000;
 const RT_RETRY_INTERVAL_MS = RT_RETRY_INTERVAL_MINUTES * 60 * 1000;
 const MC_REFRESH_INTERVAL_MS = MC_REFRESH_INTERVAL_HOURS * 3600 * 1000;
@@ -774,7 +782,9 @@ app.post("/api/omdb/refresh", (req, res) => {
   for (const id of ids) omdbRatings.entries[id].needsRefresh = true;
   omdbPausedUntil = 0; // an explicit "Sync now" outranks an ongoing back-off
   saveOmdbCache();
-  setOmdbStatus("idle", `Manual OMDb sync triggered (${ids.length} movies queued).`, { pending: ids.length });
+  // "queued", not "idle": the UI renders idle from its own template ("Up to
+  // date"), which threw this message away and made the button look dead.
+  setOmdbStatus("queued", `Manual OMDb sync triggered (${ids.length} movies queued).`, { pending: ids.length });
   wakeEngine();
   res.json({ ok: true, queued: true, count: ids.length });
 });
@@ -783,14 +793,14 @@ app.post("/api/rt/refresh", (req, res) => {
   if (!RT_SCRAPE_ENABLED) {
     return res.status(400).json({ error: "RT_SCRAPE_ENABLED is not set." });
   }
-  if (engineStatus.rt.phase === "scraping") {
+  if (engineStatus.rt.phase === "scraping" || engineStatus.rt.phase === "resolving_ids") {
     return res.json({ ok: true, alreadyRunning: true });
   }
   const ids = Object.keys(rtScores.entries);
   for (const id of ids) rtScores.entries[id].needsRefresh = true;
   rtPausedUntil = 0; // an explicit "Sync now" outranks an ongoing back-off
   saveRtCache();
-  setRtStatus("idle", `Manual Rotten Tomatoes sync triggered (${ids.length} movies queued).`, { pending: ids.length });
+  setRtStatus("queued", `Manual Rotten Tomatoes sync triggered (${ids.length} movies queued).`, { pending: ids.length });
   wakeEngine();
   res.json({ ok: true, queued: true, count: ids.length });
 });
@@ -799,14 +809,14 @@ app.post("/api/mc/refresh", (req, res) => {
   if (!MC_SCRAPE_ENABLED) {
     return res.status(400).json({ error: "MC_SCRAPE_ENABLED is not set." });
   }
-  if (engineStatus.mc.phase === "scraping") {
+  if (engineStatus.mc.phase === "scraping" || engineStatus.mc.phase === "resolving_ids") {
     return res.json({ ok: true, alreadyRunning: true });
   }
   const ids = Object.keys(mcScores.entries);
   for (const id of ids) mcScores.entries[id].needsRefresh = true;
   mcPausedUntil = 0; // an explicit "Sync now" outranks an ongoing back-off
   saveMcCache();
-  setMcStatus("idle", `Manual Metacritic sync triggered (${ids.length} movies queued).`, { pending: ids.length });
+  setMcStatus("queued", `Manual Metacritic sync triggered (${ids.length} movies queued).`, { pending: ids.length });
   wakeEngine();
   res.json({ ok: true, queued: true, count: ids.length });
 });
@@ -1061,20 +1071,32 @@ async function runWikidataQuery(query, userAgent, label) {
  * lookup that fails half way through slows the source down; it does not
  * stop it.
  */
-async function resolveRtSlugs(imdbIds) {
+async function resolveRtSlugs(imdbIds, onProgress) {
   const unknown = [...new Set(imdbIds.filter((id) => id && !(id in rtSlugs)))];
-  if (unknown.length === 0) return { ok: true };
+  if (unknown.length === 0) return { ok: true, remaining: 0 };
 
-  for (let i = 0; i < unknown.length; i += WIKIDATA_BATCH_SIZE) {
-    const batch = unknown.slice(i, i + WIKIDATA_BATCH_SIZE);
+  let resolved = 0;
+  for (let batchNo = 0; batchNo < WIKIDATA_BATCHES_PER_PASS; batchNo++) {
+    const batch = unknown.slice(resolved, resolved + WIKIDATA_BATCH_SIZE);
+    if (batch.length === 0) break;
     const query = buildRtIdQuery(batch);
-    if (!query) continue;
-    if (i > 0) await sleep(WIKIDATA_REQUEST_DELAY_MS);
+    if (!query) {
+      // Nothing in this batch is a usable IMDb id, so no query exists that
+      // could ever resolve it. Record the misses instead of breaking out:
+      // leaving them unresolved would keep this pass "in progress" forever,
+      // spinning the engine loop with nothing to do.
+      for (const id of batch) rtSlugs[id] = null;
+      resolved += batch.length;
+      saveRtSlugCache();
+      continue;
+    }
+    if (batchNo > 0) await sleep(WIKIDATA_REQUEST_DELAY_MS);
 
+    onProgress?.(resolved, unknown.length);
     const result = await runWikidataQuery(query, RT_USER_AGENT, `Rotten Tomatoes, ${batch.length} ids`);
     if (!result.ok) {
       console.error(`[RT] Wikidata id lookup failed: ${result.reason}`);
-      return result;
+      return { ...result, remaining: unknown.length - resolved };
     }
     const found = parseRtIdBindings(result.data);
     for (const id of batch) {
@@ -1082,9 +1104,10 @@ async function resolveRtSlugs(imdbIds) {
       // cover doesn't get re-queried on every single pass.
       rtSlugs[id] = found[id] ?? null;
     }
+    resolved += batch.length;
     saveRtSlugCache();
   }
-  return { ok: true };
+  return { ok: true, remaining: unknown.length - resolved };
 }
 
 /**
@@ -1139,20 +1162,32 @@ async function fetchRtScore(imdbId) {
  * with its reason, never cached, and never recorded as a missing rating -
  * while whatever earlier batches resolved is kept and still scraped.
  */
-async function resolveMcSlugs(imdbIds) {
+async function resolveMcSlugs(imdbIds, onProgress) {
   const unknown = [...new Set(imdbIds.filter((id) => id && !(id in mcSlugs)))];
-  if (unknown.length === 0) return { ok: true };
+  if (unknown.length === 0) return { ok: true, remaining: 0 };
 
-  for (let i = 0; i < unknown.length; i += WIKIDATA_BATCH_SIZE) {
-    const batch = unknown.slice(i, i + WIKIDATA_BATCH_SIZE);
+  let resolved = 0;
+  for (let batchNo = 0; batchNo < WIKIDATA_BATCHES_PER_PASS; batchNo++) {
+    const batch = unknown.slice(resolved, resolved + WIKIDATA_BATCH_SIZE);
+    if (batch.length === 0) break;
     const query = buildMetacriticIdQuery(batch);
-    if (!query) continue;
-    if (i > 0) await sleep(WIKIDATA_REQUEST_DELAY_MS);
+    if (!query) {
+      // Nothing in this batch is a usable IMDb id, so no query exists that
+      // could ever resolve it. Record the misses instead of breaking out:
+      // leaving them unresolved would keep this pass "in progress" forever,
+      // spinning the engine loop with nothing to do.
+      for (const id of batch) mcSlugs[id] = null;
+      resolved += batch.length;
+      saveMcSlugCache();
+      continue;
+    }
+    if (batchNo > 0) await sleep(WIKIDATA_REQUEST_DELAY_MS);
 
+    onProgress?.(resolved, unknown.length);
     const result = await runWikidataQuery(query, MC_USER_AGENT, `Metacritic, ${batch.length} ids`);
     if (!result.ok) {
       console.error(`[MC] Wikidata id lookup failed: ${result.reason}`);
-      return result;
+      return { ...result, remaining: unknown.length - resolved };
     }
     const found = parseMetacriticIdBindings(result.data);
     for (const id of batch) {
@@ -1160,9 +1195,10 @@ async function resolveMcSlugs(imdbIds) {
       // cover doesn't get re-queried on every single pass.
       mcSlugs[id] = found[id] ?? null;
     }
+    resolved += batch.length;
     saveMcSlugCache();
   }
-  return { ok: true };
+  return { ok: true, remaining: unknown.length - resolved };
 }
 
 /**
@@ -1776,8 +1812,18 @@ async function processPendingRt() {
   // A failed lookup is a reason to slow down, not to stop: movies whose
   // slug is already cached are scraped anyway, and only the ones still
   // missing a mapping stay pending. Backing the whole source off here is
-  // what made a single throttled query look like "Metacritic is down".
-  const lookup = await resolveRtSlugs(knownImdbIds);
+  // what made a single throttled query look like "Rotten Tomatoes is down".
+  //
+  // The id lookup gets its own reported phase: a Wikidata query can take
+  // over a minute, and a row that says "up to date" while the source is in
+  // fact working through the mapping is simply wrong.
+  const lookup = await resolveRtSlugs(knownImdbIds, (done, total) => {
+    setRtStatus("resolving_ids", `Resolving Rotten Tomatoes ids: ${done} / ${total}`, {
+      processed: done,
+      total,
+      pending: pendingIds.length,
+    });
+  });
   const scrapable = pendingIds.filter((id) => {
     const imdbId = tmdbDetails[id]?.imdbId;
     return !imdbId || imdbId in rtSlugs;
@@ -1795,6 +1841,16 @@ async function processPendingRt() {
       return true;
     }
     debugLog(`[RT] Wikidata lookup failed (${lookup.reason}); scraping ${scrapable.length} already-mapped movie(s), ${unresolved} left pending`);
+  }
+
+  if (scrapable.length === 0) {
+    // Nothing mapped yet, but the lookup itself is fine - it just has more
+    // batches to go. Report that rather than falling through to a
+    // zero-length "scrape" that would look like a completed sync.
+    setRtStatus("resolving_ids", `Resolving Rotten Tomatoes ids: ${pendingIds.length - (lookup.remaining ?? 0)} / ${pendingIds.length}`, {
+      pending: pendingIds.length,
+    });
+    return true;
   }
 
   let processed = 0;
@@ -1859,12 +1915,19 @@ async function processPendingRt() {
   const unmapped = pendingIds.length - scrapable.length;
   if (unmapped > 0) {
     // Partial pass: everything mapped is up to date, the rest is waiting on
-    // Wikidata, not on Rotten Tomatoes. Said plainly rather than reported as
-    // a finished sync.
-    const waitMinutes = Math.max(1, Math.round((rtPausedUntil - Date.now()) / 60000));
-    setRtStatus("error", `${processed} tomatometer(s) updated; ${unmapped} still need their Rotten Tomatoes id from Wikidata (retrying in ${waitMinutes} minute(s)).`, {
-      pending: unmapped,
-    });
+    // its Wikidata id - either because the lookup failed (then we are backing
+    // off and say so) or simply because this pass resolved its share and the
+    // next one continues. Neither is a finished sync.
+    if (!lookup.ok) {
+      const waitMinutes = Math.max(1, Math.round((rtPausedUntil - Date.now()) / 60000));
+      setRtStatus("error", `${processed} tomatometer(s) updated; ${unmapped} still need their Rotten Tomatoes id from Wikidata (retrying in ${waitMinutes} minute(s)).`, {
+        pending: unmapped,
+      });
+    } else {
+      setRtStatus("resolving_ids", `${processed} tomatometer(s) updated; resolving ids for ${unmapped} more ...`, {
+        pending: unmapped,
+      });
+    }
     return true;
   }
   rtScores.lastFullSync = new Date().toISOString();
@@ -1914,8 +1977,15 @@ async function processPendingMc() {
   saveTmdbDetailsCache();
 
   // As in the RT pass: a failed lookup costs the unmapped movies, not the
-  // whole source.
-  const lookup = await resolveMcSlugs(knownImdbIds);
+  // whole source, and the lookup itself is a reported phase rather than
+  // silent time spent under an "up to date" label.
+  const lookup = await resolveMcSlugs(knownImdbIds, (done, total) => {
+    setMcStatus("resolving_ids", `Resolving Metacritic ids: ${done} / ${total}`, {
+      processed: done,
+      total,
+      pending: pendingIds.length,
+    });
+  });
   const scrapable = pendingIds.filter((id) => {
     const imdbId = tmdbDetails[id]?.imdbId;
     return !imdbId || imdbId in mcSlugs;
@@ -1932,6 +2002,13 @@ async function processPendingMc() {
       return true;
     }
     debugLog(`[MC] Wikidata lookup failed (${lookup.reason}); scraping ${scrapable.length} already-mapped movie(s), ${unresolved} left pending`);
+  }
+
+  if (scrapable.length === 0) {
+    setMcStatus("resolving_ids", `Resolving Metacritic ids: ${pendingIds.length - (lookup.remaining ?? 0)} / ${pendingIds.length}`, {
+      pending: pendingIds.length,
+    });
+    return true;
   }
 
   let processed = 0;
@@ -1995,10 +2072,16 @@ async function processPendingMc() {
   saveMcCache();
   const unmapped = pendingIds.length - scrapable.length;
   if (unmapped > 0) {
-    const waitMinutes = Math.max(1, Math.round((mcPausedUntil - Date.now()) / 60000));
-    setMcStatus("error", `${processed} Metascore(s) updated; ${unmapped} still need their Metacritic id from Wikidata (retrying in ${waitMinutes} minute(s)).`, {
-      pending: unmapped,
-    });
+    if (!lookup.ok) {
+      const waitMinutes = Math.max(1, Math.round((mcPausedUntil - Date.now()) / 60000));
+      setMcStatus("error", `${processed} Metascore(s) updated; ${unmapped} still need their Metacritic id from Wikidata (retrying in ${waitMinutes} minute(s)).`, {
+        pending: unmapped,
+      });
+    } else {
+      setMcStatus("resolving_ids", `${processed} Metascore(s) updated; resolving ids for ${unmapped} more ...`, {
+        pending: unmapped,
+      });
+    }
     return true;
   }
   mcScores.lastFullSync = new Date().toISOString();

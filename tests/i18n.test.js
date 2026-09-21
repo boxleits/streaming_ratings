@@ -42,7 +42,7 @@ test("localizePhaseMessage: supports the rt provider, per language", () => {
   assert.match(en, /42/);
   assert.match(de, /42/);
   assert.notEqual(en, de);
-  assert.equal(localizePhaseMessage("rt", { phase: "idle" }, "de"), "Aktuell");
+  assert.equal(localizePhaseMessage("rt", { phase: "idle", lastSync: "2026-09-21T20:14:00.000Z" }, "de"), "Aktuell");
 });
 
 test("localizePhaseMessage: supports the mc (Metacritic) provider, per language", () => {
@@ -51,7 +51,39 @@ test("localizePhaseMessage: supports the mc (Metacritic) provider, per language"
   assert.match(en, /42/);
   assert.match(de, /42/);
   assert.notEqual(en, de);
-  assert.equal(localizePhaseMessage("mc", { phase: "idle" }, "de"), "Aktuell");
+  assert.equal(localizePhaseMessage("mc", { phase: "idle", lastSync: "2026-09-21T20:14:00.000Z" }, "de"), "Aktuell");
+});
+
+test("localizePhaseMessage: the id-resolution phase is reported, not rendered as 'up to date'", () => {
+  // The regression this guards: while a scraper worked through the Wikidata
+  // id mapping (minutes, on a fresh catalog) its row had no template for
+  // that phase and fell back to... nothing useful. A source that is working
+  // must never read as idle.
+  const en = localizePhaseMessage("mc", { phase: "resolving_ids", processed: 200, total: 450 }, "en");
+  const de = localizePhaseMessage("mc", { phase: "resolving_ids", processed: 200, total: 450 }, "de");
+  assert.match(en, /200 \/ 450/);
+  assert.match(de, /200 \/ 450/);
+  assert.notEqual(en, localizePhaseMessage("mc", { phase: "idle", lastSync: null }, "en"));
+  assert.notEqual(de, localizePhaseMessage("mc", { phase: "idle", lastSync: null }, "de"));
+
+  assert.match(localizePhaseMessage("rt", { phase: "resolving_ids", processed: 1, total: 2 }, "en"), /Rotten Tomatoes ids/);
+});
+
+test("localizePhaseMessage: resolving_ids without a count falls back to the server's own wording", () => {
+  const msg = localizePhaseMessage("mc", { phase: "resolving_ids", message: "12 Metascore(s) updated; resolving ids for 38 more ..." }, "en");
+  assert.match(msg, /38 more/);
+});
+
+test("localizePhaseMessage: a manual sync is visible as its own phase", () => {
+  // "Sync now" used to report phase 'idle', whose template says "Up to
+  // date" - so pressing the button looked like nothing happened at all.
+  for (const provider of ["omdb", "rt", "mc"]) {
+    const en = localizePhaseMessage(provider, { phase: "queued", pending: 7935 }, "en");
+    const de = localizePhaseMessage(provider, { phase: "queued", pending: 7935 }, "de");
+    assert.match(en, /7935/, `${provider} (en)`);
+    assert.match(de, /7935/, `${provider} (de)`);
+    assert.notEqual(en, localizePhaseMessage(provider, { phase: "idle" }, "en"), `${provider} must not read as idle`);
+  }
 });
 
 test("localizePhaseMessage: supports the trakt provider too, per language", () => {
@@ -60,6 +92,22 @@ test("localizePhaseMessage: supports the trakt provider too, per language", () =
   assert.match(en, /approve/i);
   assert.match(de, /best.tigung/i);
   assert.notEqual(en, de);
+});
+
+test("localizePhaseMessage: a source that has never completed a sync does NOT claim to be up to date", () => {
+  // Reported from a live deployment: the Metacritic row read "Up to date -
+  // last full sync: never" while 7935 movies sat unchecked.
+  assert.equal(localizePhaseMessage("mc", { phase: "idle", lastSync: null }, "en"), "Not started yet");
+  assert.equal(localizePhaseMessage("mc", { phase: "idle", lastSync: null }, "de"), "Noch nicht gestartet");
+  assert.equal(localizePhaseMessage("rt", { phase: "idle", lastSync: null }, "en"), "Not started yet");
+  assert.equal(localizePhaseMessage("omdb", { phase: "idle", lastFullSync: null }, "en"), "Not started yet");
+});
+
+test("localizePhaseMessage: once a sync has completed, idle does mean up to date", () => {
+  const done = "2026-09-21T20:14:00.000Z";
+  assert.equal(localizePhaseMessage("mc", { phase: "idle", lastSync: done }, "en"), "Up to date");
+  assert.equal(localizePhaseMessage("rt", { phase: "idle", lastSync: done }, "de"), "Aktuell");
+  assert.equal(localizePhaseMessage("omdb", { phase: "idle", lastFullSync: done }, "de"), "Aktuell");
 });
 
 test("formatLocalizedDate: returns the localized 'never' placeholder for a missing date", () => {
