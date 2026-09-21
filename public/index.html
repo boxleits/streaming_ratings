@@ -371,7 +371,7 @@
   </div>
 
 <script type="module">
-  import { formatScore, passesColumnFilter, passesAllColumnFilters, compareMovies, paginate } from "./js/filters.js";
+  import { formatScore, passesColumnFilter, passesAllColumnFilters, compareMovies, paginate, readColumnFilters } from "./js/filters.js";
   import { createConnectionManager } from "./js/connection.js";
   import {
     getStrings,
@@ -415,7 +415,9 @@
 
   let currentLang = getStoredLanguage(window.localStorage, window.navigator);
 
-  let columnFilters = { title: "", genres: "", year: "", rt: "", metacritic: "", watched: "" };
+  // Note there is no columnFilters variable: the filter inputs themselves
+  // are that state, read fresh on every render via readColumnFilters (see
+  // filters.js for why mirroring them into a variable was a bug).
   let sortState = { field: "year", dir: "desc" };
   let renderScheduled = false;
 
@@ -499,7 +501,7 @@
 
     const t = getStrings(currentLang);
     const all = Array.from(movieMap.values()).map((m) => projectMovieForLocale(m, currentLang));
-    let rows = all.filter((m) => passesAllColumnFilters(m, columnFilters));
+    let rows = all.filter((m) => passesAllColumnFilters(m, readColumnFilters(document)));
     rows.sort((a, b) => compareMovies(a, b, sortState.field, sortState.dir));
 
     // Filtering/sorting above always run over the FULL dataset - only the
@@ -606,16 +608,12 @@
   });
 
   document.querySelectorAll(".filter-row input[data-filter]").forEach((input) => {
-    input.addEventListener("input", () => {
-      columnFilters[input.getAttribute("data-filter")] = input.value;
-      renderTable({ resetPaging: true });
-    });
+    input.addEventListener("input", () => renderTable({ resetPaging: true }));
   });
 
   clearFiltersBtn.addEventListener("click", () => {
     document.querySelectorAll(".filter-row input[data-filter]").forEach((input) => {
       input.value = "";
-      columnFilters[input.getAttribute("data-filter")] = "";
     });
     renderTable({ resetPaging: true });
   });
