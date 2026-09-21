@@ -55,6 +55,7 @@ their own section; with both on, **OMDb becomes optional entirely**.
 | `MC_REFRESH_INTERVAL_HOURS`    | no       | `24`                      | How old a Metascore may get before it's re-scraped. Its own knob, independent of RT's and of `OMDB_REFRESH_INTERVAL_HOURS`. |
 | `MC_RETRY_INTERVAL_MINUTES`    | no       | `30`                      | How long Metacritic backs off after metacritic.com or Wikidata is unreachable. Separate from RT's and OMDb's: the sources fail for unrelated reasons. |
 | `MC_USER_AGENT`                | no       | a descriptive default     | User-Agent sent to Wikidata/Metacritic. Wikidata rejects generic clients, so keep it descriptive. |
+| `WIKIDATA_REQUEST_DELAY_MS`    | no       | `1200`                    | Wait between consecutive SPARQL queries. query.wikidata.org enforces a per-client query budget, and a catalog-sized first run walks through several batches for each scraper. Paid once per catalog — the mappings are cached permanently. |
 | `TRAKT_CLIENT_ID`              | no       | –                         | Trakt API app Client ID. Leave both Trakt vars unset to disable the feature entirely (the "Watched" column and Trakt status row are hidden). |
 | `TRAKT_CLIENT_SECRET`          | no       | –                         | Trakt API app Client Secret. Needed together with `TRAKT_CLIENT_ID` for the device-code OAuth flow. |
 | `TRAKT_REFRESH_INTERVAL_HOURS` | no       | `24`                      | How often the watched-history sync re-runs once connected |
@@ -101,6 +102,27 @@ Tomatoes movie page instead:
   pending and RT backs off for `RT_RETRY_INTERVAL_MINUTES` (OMDb keeps
   running meanwhile), so an outage can't silently turn hundreds of movies
   into false "N/A"s.
+
+### When the Wikidata id lookup fails
+
+Both scrapers depend on one shared upstream for their id mapping, and
+`query.wikidata.org` enforces a **per-client query budget** — a first run
+over a large catalog is exactly the traffic shape that runs into it. What
+happens then:
+
+- The status row **names the reason**, including the HTTP status
+  (`HTTP 429 (rate limited by Wikidata)`, `HTTP 403`, a network error), and
+  the same line is written to the server log. "Unreachable" on its own is
+  not something anyone can act on.
+- A throttled or briefly failing query (429/5xx) is **retried once** after a
+  short pause. When Wikidata sends a `Retry-After`, that wait is honoured
+  instead (clamped to between 1 minute and 6 hours) rather than the
+  source's own retry interval — and it is applied as a back-off timestamp,
+  never as a sleep inside the pass, so no other source is held up.
+- A failed lookup **does not stop the source**. Movies whose slug is already
+  cached are scraped as usual; only the ones still missing a mapping stay
+  pending, and the status says how many ("… 12 still need their Metacritic
+  id from Wikidata"). Mappings resolved before the failure are kept.
 
 ### Metacritic, the same way (`MC_SCRAPE_ENABLED`)
 
